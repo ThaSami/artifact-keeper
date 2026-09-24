@@ -1274,6 +1274,7 @@ async fn lookup_identifiers(
     Ok(swift_json_response(StatusCode::OK, body))
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1821,6 +1822,7 @@ mod tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -1936,6 +1938,7 @@ mod db_cov_tests {
 /// `download_archive` sibling filters through the caller-authorized
 /// `resolve_virtual_download`; the manifest walk now applies the same
 /// `proxy_helpers::try_authorize_virtual_members` predicate.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod virtual_member_authz_tests {
     use axum::http::StatusCode;
@@ -2073,6 +2076,7 @@ mod virtual_member_authz_tests {
 /// the stored object began with a multipart boundary rather than `PK\x03\x04`,
 /// and `checksum_sha256` (echoed as the release-metadata `checksum` and the
 /// download `Digest` header) hashed the envelope instead of the archive.
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod multipart_publish_tests {
     use axum::body::Body;
@@ -2334,6 +2338,7 @@ mod multipart_publish_tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
