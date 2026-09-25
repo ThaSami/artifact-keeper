@@ -425,8 +425,19 @@ impl PackageService {
         // guard rejected the update (in which case that row is unchanged and
         // still the representative).
         if should_update_package_row {
-            sqlx::query(sqlx::AssertSqlSafe(&*format!(
-                r#"
+            // #3931: two concurrent publishes of the same (package, version)
+            // race this statement — the loser's ON CONFLICT guard returns no
+            // `upserted` row and the fallback subquery still reads the
+            // statement-start snapshot, which predates the winner's
+            // just-committed `package_versions` row, so `COALESCE(NULL, NULL)`
+            // lands in `packages.size_bytes NOT NULL` (23502). A retry gets a
+            // fresh snapshot where the winner's row is visible. Bounded; any
+            // other error propagates immediately.
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let result = sqlx::query(sqlx::AssertSqlSafe(&*format!(
+                    r#"
                 {VERSION_UPSERT_CTE}
                 UPDATE packages
                 SET version = $2,
@@ -444,15 +455,23 @@ impl PackageService {
                     updated_at = NOW()
                 WHERE id = $1
                 "#
-            )))
-            .bind(package_id)
-            .bind(version)
-            .bind(size_bytes)
-            .bind(checksum_sha256)
-            .bind(description)
-            .bind(&metadata)
-            .execute(&self.db)
-            .await?;
+                )))
+                .bind(package_id)
+                .bind(version)
+                .bind(size_bytes)
+                .bind(checksum_sha256)
+                .bind(description)
+                .bind(&metadata)
+                .execute(&self.db)
+                .await;
+                const MAX_UPSERT_ATTEMPTS: u32 = 3;
+                let retryable = matches!(&result, Err(e)
+                    if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("23502"));
+                if !retryable || attempt >= MAX_UPSERT_ATTEMPTS {
+                    result?;
+                    break;
+                }
+            }
         } else {
             // Data-modifying CTEs execute exactly once even when
             // unreferenced, so the version upsert still runs.
@@ -758,7 +777,7 @@ struct BackfillRow {
 
 /// True for a Maven path that describes a package rather than being one:
 /// repository metadata, or a checksum/signature beside a real asset (#4169).
-fn is_maven_sidecar(path: &str) -> bool {
+pub(crate) fn is_maven_sidecar(path: &str) -> bool {
     let file = path.rsplit('/').next().unwrap_or(path);
     file == "maven-metadata.xml"
         || file == "maven-metadata-local.xml"
@@ -829,6 +848,13 @@ pub fn backfill_catalog_coordinates(
         }
         // The protobuf label index is an artifact row, not a module.
         "protobuf" if version == "_labels" => None,
+        // Go publishes two artifact rows per module version: the `.zip` (the
+        // distributable) and the `.mod`/`.info` sidecars. Helm charts carry a
+        // `.prov` provenance sidecar. None of those may register catalog rows:
+        // the archive row does, and letting the sidecar race it makes the
+        // catalog's size_bytes flip with row order (#4191).
+        "go" if path.ends_with(".mod") || path.ends_with(".info") => None,
+        "helm" if path.ends_with(".prov") => None,
         _ => {
             let name = name.trim();
             if name.is_empty() {
@@ -1834,6 +1860,143 @@ mod catalog_maintenance_tests {
             package_is_listed(&fx, "proxied-lib").await,
             "remote catalog rows never join `artifacts` and stay listed"
         );
+        fx.teardown().await;
+    }
+
+    // -- #4191 / #3931: sidecar exclusion and upsert race -------------------
+
+    /// #4191: Go publishes two artifact rows per module version (`.zip` +
+    /// `.mod`, plus `.info`), and Helm charts carry a `.prov` sidecar. Only
+    /// the archive row may produce catalog coordinates.
+    #[test]
+    fn backfill_excludes_go_and_helm_sidecar_rows_4191() {
+        assert_eq!(
+            backfill_catalog_coordinates(
+                "go",
+                "example.com/mod/@v/v1.0.0.zip",
+                "example.com/mod",
+                Some("v1.0.0"),
+            ),
+            Some(("example.com/mod".to_string(), "v1.0.0".to_string()))
+        );
+        for path in [
+            "example.com/mod/@v/v1.0.0.mod",
+            "example.com/mod/@v/v1.0.0.info",
+        ] {
+            assert_eq!(
+                backfill_catalog_coordinates("go", path, "example.com/mod", Some("v1.0.0")),
+                None,
+                "{path}"
+            );
+        }
+        assert!(backfill_catalog_coordinates(
+            "helm",
+            "charts/mychart-1.0.0.tgz",
+            "mychart",
+            Some("1.0.0")
+        )
+        .is_some());
+        assert_eq!(
+            backfill_catalog_coordinates(
+                "helm",
+                "charts/mychart-1.0.0.tgz.prov",
+                "mychart",
+                Some("1.0.0"),
+            ),
+            None
+        );
+    }
+
+    /// #4191: with both artifact rows present, the backfill reports the
+    /// archive's size — not whichever row the walk happened to hit last.
+    /// Pre-fix the `.mod` row wins deterministically here because its
+    /// (checksum, size) sorts lower, so this fails red before the fix.
+    #[tokio::test]
+    async fn backfill_go_module_reports_the_archive_size_4191() {
+        let Some(fx) = tdh::Fixture::setup("local", "go").await else {
+            return;
+        };
+        // (checksum, size) ordering puts the `.mod` row first, so the
+        // deterministic guard would pick it if the row were considered.
+        for (suffix, checksum, size) in [
+            ("mod", "0".repeat(64), 350_i64),
+            ("zip", "f".repeat(64), 100_000_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO artifacts \
+                 (repository_id, path, name, version, size_bytes, checksum_sha256, content_type, storage_key) \
+                 VALUES ($1, $2, 'example.com/mod', 'v1.0.0', $3, $4, 'application/octet-stream', $5)",
+            )
+            .bind(fx.repo_id)
+            .bind(format!("example.com/mod/@v/v1.0.0.{suffix}"))
+            .bind(size)
+            .bind(checksum)
+            .bind(format!("testdata/4191/{suffix}"))
+            .execute(&fx.pool)
+            .await
+            .expect("seed go artifact row");
+        }
+
+        PackageService::new(fx.pool.clone())
+            .backfill_catalog(Some(fx.repo_id))
+            .await
+            .expect("backfill");
+        let size: i64 = sqlx::query_scalar(
+            "SELECT size_bytes FROM packages WHERE repository_id = $1 AND name = 'example.com/mod'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("packages row for the module");
+
+        fx.teardown().await;
+
+        assert_eq!(size, 100_000, "the catalog reports the archive's size");
+    }
+
+    /// #3931: two concurrent publishers of the same (name, version) raced the
+    /// upsert CTE into writing `COALESCE(NULL, NULL)` into
+    /// `packages.size_bytes NOT NULL` (23502). This loop made that crash
+    /// likely within a handful of iterations pre-fix; with the retry both
+    /// tasks run clean.
+    #[tokio::test]
+    async fn concurrent_publish_same_version_never_violates_size_not_null_3931() {
+        let Some(fx) = tdh::Fixture::setup("local", "generic").await else {
+            return;
+        };
+        let mut handles = Vec::new();
+        for tag in ["a", "b"] {
+            let svc = PackageService::new(fx.pool.clone());
+            let repo_id = fx.repo_id;
+            handles.push(tokio::spawn(async move {
+                for i in 0..60_i64 {
+                    svc.create_or_update_from_artifact(
+                        repo_id,
+                        "race-pkg",
+                        "1.0.0",
+                        if tag == "a" { 100 + i } else { 200 + i },
+                        &format!("{}{:0>63}", tag, i),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("upsert must not fail with 23502 (#3931)");
+                }
+            }));
+        }
+        for h in handles {
+            h.await.expect("publisher task panicked");
+        }
+
+        let size: i64 = sqlx::query_scalar(
+            "SELECT size_bytes FROM packages WHERE repository_id = $1 AND name = 'race-pkg'",
+        )
+        .bind(fx.repo_id)
+        .fetch_one(&fx.pool)
+        .await
+        .expect("packages row exists");
+        assert!(size > 0, "size_bytes must be a real size, got {size}");
+
         fx.teardown().await;
     }
 }
