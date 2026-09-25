@@ -1701,16 +1701,13 @@ async fn publish(
     // Invalidate the index cache for this crate so the next fetch sees the new version.
     index_cache_invalidate(&state.index_cache, &format!("{}:{}", repo_key, name_lower)).await;
 
-    // Also invalidate any virtual repos that include this hosted repo.
-    let virtual_keys: Vec<String> = sqlx::query_scalar(
-        "SELECT r.key FROM repositories r \
-         INNER JOIN virtual_repo_members vrm ON r.id = vrm.virtual_repo_id \
-         WHERE vrm.member_repo_id = $1",
-    )
-    .bind(repo.id)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
+    // Also invalidate every virtual repo that includes this hosted repo —
+    // recursively, so a virtual nesting the crate's direct parent converges
+    // too instead of serving a stale index entry (#3840).
+    let virtual_keys: Vec<String> =
+        crate::services::repository_service::RepositoryService::new(state.db.clone())
+            .virtual_ancestor_keys(repo.id)
+            .await;
 
     for vkey in &virtual_keys {
         index_cache_invalidate(&state.index_cache, &format!("{}:{}", vkey, name_lower)).await;
@@ -2371,8 +2368,9 @@ async fn try_remote_index(
 ///   repos that host crates directly; rebuild the sparse-index lines from
 ///   DB rows.
 ///
-/// * **Virtual** (nested) — skipped defensively to avoid recursion; not
-///   a supported configuration.
+/// * **Virtual** (nested) — unreachable post-#3840 (the member walk is
+///   recursive and leaf-only); the arm stays as a defensive skip so a
+///   regression that lets a virtual row through cannot recurse.
 ///
 /// NOTE: This does not use `resolve_virtual_metadata` because cargo index
 /// resolution honours `index_upstream_url` config overrides for the proxy
@@ -2560,8 +2558,9 @@ async fn try_virtual_index(
                 }
             }
             RepositoryType::Virtual => {
-                // Nested virtuals are not supported and would cause recursion.
-                // Skip defensively rather than attempting a lookup.
+                // Unreachable post-#3840 (the member walk is recursive and
+                // leaf-only); defensive skip so a regression that lets a
+                // virtual row through skips instead of recursing.
                 continue;
             }
         }

@@ -1988,10 +1988,13 @@ async fn fetch_maven_prefixes_bytes_uncached(
                         // the hosted generator would report it as
                         // CONFIRMED-EMPTY and the group would publish an
                         // allowlist missing everything behind it — the
-                        // spurious file #3383 forbids. Nesting is supported
-                        // (`MAX_VIRTUAL_DEPTH`), so this is reachable; treat
-                        // it as "set unknown" and bail the whole union, the
-                        // same as an unreachable Remote member.
+                        // spurious file #3383 forbids. Post-#3840 the member
+                        // walk is recursive and leaf-only, so this arm is
+                        // unreachable in practice; it stays as a fail-closed
+                        // guard — if a virtual row ever reached this loop the
+                        // union would be unknowable and must bail (the same
+                        // as an unreachable Remote member), never report
+                        // confirmed-empty.
                         RepositoryType::Virtual => Err(PrefixesError::NotFound(
                             "Prefix file not available".to_string(),
                         )),
@@ -5899,14 +5902,18 @@ mod tests {
         );
     }
 
-    /// #3382 round 2: a Virtual member owns no artifacts of its own, so
-    /// routing it to the hosted generator counted it as confirmed-empty and
-    /// the group published an allowlist missing everything behind it. The
-    /// union is unknowable without recursing, so the group must 404 (which
-    /// Resolver reads as "don't filter, ask the repository") rather than
-    /// serve the spurious file #3383 forbids.
+    /// #3382 round 2, UPDATED by #3840: pre-#3840 a nested Virtual member
+    /// made the union unknowable (the single-level member walk returned the
+    /// intermediate virtual row, which owns no artifacts), so the group bailed
+    /// with 404 rather than publish a spurious partial allowlist. Member
+    /// expansion is now RECURSIVE — the nested virtual contributes its leaf
+    /// members, so the union IS complete and the group serves 200 with the
+    /// leaf's prefixes merged in. The defensive `RepositoryType::Virtual` bail
+    /// arm in `fetch_maven_prefixes_bytes_uncached` stays: it is unreachable
+    /// while the walk returns leaves only, and it keeps a future regression
+    /// failing closed.
     #[tokio::test]
-    async fn test_virtual_prefixes_bails_on_nested_virtual_member() {
+    async fn test_virtual_prefixes_merges_nested_virtual_member() {
         use crate::api::handlers::test_db_helpers as tdh;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -5983,15 +5990,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(&inner_dir);
         let _ = std::fs::remove_dir_all(&outer_dir);
 
-        assert_ne!(
+        assert_eq!(
             status,
             StatusCode::OK,
-            "a nested virtual member makes the union unknowable; publishing a \
-             partial allowlist would make Resolver stop asking for the members \
-             behind it: {}",
+            "recursive member expansion (#3840) makes the union complete: the \
+             nested virtual contributes its leaf, so the group must serve the \
+             merged prefixes, not bail: {}",
             String::from_utf8_lossy(&body)
         );
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        let text = String::from_utf8_lossy(&body);
+        let prefix_lines: Vec<&str> = text.lines().filter(|l| l.starts_with('/')).collect();
+        assert_eq!(
+            prefix_lines,
+            ["/com/acme/prfxnest"],
+            "the nested leaf's group prefix must appear exactly once (the leaf \
+             is a direct member AND reachable through the nested virtual — the \
+             walk dedups it): {}",
+            text
+        );
+    }
+
+    /// #3840 companion to the merge test above: there the leaf is ALSO a
+    /// direct member, so a single-level walk would still have listed its
+    /// prefix. Here a prefix lives ONLY behind the nested virtual, so it can
+    /// appear in the union only if the walk really recursed.
+    #[tokio::test]
+    async fn test_virtual_prefixes_includes_prefix_only_behind_nested_virtual() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+
+        let (user_id, username) = tdh::create_user(&pool).await;
+        // `leaf` sits ONLY behind the inner virtual; `direct` is a direct
+        // member of the outer one. A single-level walk lists `direct` alone.
+        let (leaf_id, _leaf_key, leaf_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        let (direct_id, _direct_key, direct_dir) = tdh::create_repo(&pool, "local", "maven").await;
+        insert_maven_artifact_row(&pool, leaf_id, user_id, "com.acme.prfxonly.inner", "leaf").await;
+        insert_maven_artifact_row(
+            &pool,
+            direct_id,
+            user_id,
+            "com.acme.prfxonly.direct",
+            "direct",
+        )
+        .await;
+
+        // inner virtual -> leaf ; outer virtual -> [inner, direct]
+        let mut virtual_ids = Vec::new();
+        for _ in 0..2 {
+            let id = Uuid::new_v4();
+            let key = format!("v-prfxonly-{}", id.simple());
+            let dir = std::env::temp_dir().join(format!("prfxonly-{}", id));
+            std::fs::create_dir_all(&dir).expect("create virtual storage dir");
+            sqlx::query(
+                "INSERT INTO repositories (id, key, name, storage_path, repo_type, format, is_public) \
+                 VALUES ($1, $2, $3, $4, 'virtual'::repository_type, 'maven'::repository_format, true)",
+            )
+            .bind(id)
+            .bind(&key)
+            .bind(&key)
+            .bind(&*dir.to_string_lossy())
+            .execute(&pool)
+            .await
+            .expect("insert virtual repo");
+            virtual_ids.push((id, key, dir));
+        }
+        let (inner_id, _inner_key, inner_dir) = virtual_ids[0].clone();
+        let (outer_id, outer_key, outer_dir) = virtual_ids[1].clone();
+
+        tdh::link_virtual_member(&pool, inner_id, leaf_id, 1).await;
+        tdh::link_virtual_member(&pool, outer_id, inner_id, 1).await;
+        tdh::link_virtual_member(&pool, outer_id, direct_id, 2).await;
+        sqlx::query("UPDATE repositories SET is_public = true WHERE id = ANY($1)")
+            .bind(vec![leaf_id, direct_id])
+            .execute(&pool)
+            .await
+            .expect("publish leaf members");
+
+        let state = tdh::build_state(pool.clone(), leaf_dir.to_str().unwrap());
+        let auth = tdh::make_auth(user_id, &username);
+        let router = tdh::router_with_auth(super::router(), state.clone(), auth);
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/{}/.meta/prefixes.txt", outer_key))
+            .body(Body::empty())
+            .expect("build GET prefixes.txt");
+        let (status, body) = tdh::send(router, req).await;
+
+        for id in [inner_id, outer_id] {
+            let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE virtual_repo_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        let _ = sqlx::query("DELETE FROM virtual_repo_members WHERE member_repo_id = $1")
+            .bind(inner_id)
+            .execute(&pool)
+            .await;
+        for id in [inner_id, outer_id] {
+            let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
+        tdh::cleanup_member_repo(&pool, leaf_id, &leaf_dir).await;
+        tdh::cleanup_member_repo(&pool, direct_id, &direct_dir).await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&inner_dir);
+        let _ = std::fs::remove_dir_all(&outer_dir);
+
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "with recursive member expansion the union is knowable and the \
+             group must publish it: {text}"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "## repository-prefixes/2.0");
+        assert_eq!(
+            lines[1..],
+            ["/com/acme/prfxonly/direct", "/com/acme/prfxonly/inner"],
+            "the prefix that lives only behind the nested virtual must be in \
+             the union alongside the direct member's: {text}"
+        );
     }
 
     #[test]
