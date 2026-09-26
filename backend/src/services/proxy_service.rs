@@ -1392,11 +1392,21 @@ impl CacheStore {
     ///
     /// The checksum verification (and its miss-on-mismatch) is identical for
     /// both flags.
+    ///
+    /// `preloaded_metadata` (#3951): the sidecar the CALLER already loaded to
+    /// make its freshness decision. Before this parameter existed, a buffered
+    /// fetch read the same `__cache_meta__.json` twice per hit — once through
+    /// the #2301 in-process LRU for the freshness decision, then again here,
+    /// bypassing the LRU, for the body read. Reusing the in-hand sidecar
+    /// removes that second object-store round trip and the two reads can no
+    /// longer disagree. `None` preserves the direct read for callers that do
+    /// not have the sidecar in hand.
     async fn get(
         &self,
         cache_key: &str,
         metadata_key: &str,
         allow_stale: bool,
+        preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
         // Per-branch proxy-cache observability (#1263 follow-up / PR #1284).
         // Only the FRESH lookup (`allow_stale == false`) is counted: that is
@@ -1409,9 +1419,12 @@ impl CacheStore {
         // prefix; see `repo_key_from_cache_key`.
         let repo_label = repo_key_from_cache_key(&self.scope, cache_key);
 
-        // Load metadata. Fresh treats a read/parse error as a miss (B6); stale
-        // propagates it via `?` to match the original behavior precisely.
-        let metadata = if allow_stale {
+        // Load metadata — or reuse the caller's sidecar (#3951). Fresh treats
+        // a read/parse error as a miss (B6); stale propagates it via `?` to
+        // match the original behavior precisely.
+        let metadata = if let Some(metadata) = preloaded_metadata {
+            metadata
+        } else if allow_stale {
             match self.load_metadata(metadata_key).await? {
                 Some(m) => m,
                 None => return Ok(None),
@@ -3690,7 +3703,8 @@ impl ProxyService {
     ) -> Result<Option<CachedBody>> {
         let cache_key = Self::cache_storage_key(&self.cache_scope, repo_key, path)?;
         let metadata_key = Self::cache_metadata_key(&self.cache_scope, repo_key, path)?;
-        self.get_cached_artifact(&cache_key, &metadata_key).await
+        self.get_cached_artifact(&cache_key, &metadata_key, None)
+            .await
     }
 
     /// Metadata-only freshness check for a proxy-cached artifact.
@@ -3993,15 +4007,26 @@ impl ProxyService {
         self.coordinator.coordinate(
             &hydration_lease_key,
             || async {
-                let cached = self.get_cached_artifact(&cache_key, &metadata_key).await?;
+                // Load the sidecar ONCE through the #2301 LRU and reuse it for
+                // the body read (#3951): this follower re-check used to pay
+                // two storage reads for the same `__cache_meta__.json` — a
+                // direct read inside `get_cached_artifact`, then an LRU read
+                // below for the quarantine/negative re-checks. A memoized
+                // `None` is deliberately NOT passed down: the body read then
+                // falls back to a fresh storage read, so a leader's
+                // just-written sidecar is still observed (#3335).
+                let metadata = self.load_cache_metadata(&metadata_key).await.unwrap_or(None);
+                let cached = self
+                    .get_cached_artifact(&cache_key, &metadata_key, metadata.clone())
+                    .await?;
                 if cached.is_some() {
                     // Package Age Policy (#1770): a follower re-checking the
                     // cache must not serve an entry the leader just wrote
                     // under an active hold. The sidecar load mirrors the
-                    // B6-safe stance (read error -> no hold known).
-                    if let Some(metadata) =
-                        self.load_cache_metadata(&metadata_key).await.unwrap_or(None)
-                    {
+                    // B6-safe stance (read error -> no hold known), and the
+                    // hold is evaluated against the SAME sidecar revision the
+                    // body was verified against.
+                    if let Some(metadata) = &metadata {
                         check_quarantine_until(metadata.quarantine_until)?;
                     }
                     return Ok(cached);
@@ -4011,8 +4036,7 @@ impl ProxyService {
                 // a fresh negative hit as NotFound so the follower short-circuits
                 // the leader-recorded 404 instead of re-fetching upstream after
                 // the wait deadline (bounded to <=1 extra 404/replica without it).
-                if let Some(metadata) = self.load_cache_metadata(&metadata_key).await.unwrap_or(None)
-                {
+                if let Some(metadata) = &metadata {
                     if metadata
                         .negative_cached_until
                         .is_some_and(|until| until > Utc::now())
@@ -4213,7 +4237,7 @@ impl ProxyService {
                         // Transient error (5xx / timeout / transport): RFC 5861
                         // stale-if-error — serve the stale body we already hold.
                         if let Ok(Some((stale_content, stale_content_type, stale_content_encoding))) = self
-                            .get_stale_cached_artifact(&cache_key, &metadata_key)
+                            .get_stale_cached_artifact(&cache_key, &metadata_key, None)
                             .await
                         {
                             tracing::warn!(
@@ -6323,8 +6347,10 @@ impl ProxyService {
         &self,
         cache_key: &str,
         metadata_key: &str,
+        preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
-        self.get_cached(cache_key, metadata_key, false).await
+        self.get_cached(cache_key, metadata_key, false, preloaded_metadata)
+            .await
     }
 
     /// Up-front cache read with #1611 classification + conditional
@@ -6375,8 +6401,14 @@ impl ProxyService {
                 )?;
                 // Serve the body. Immutable hits reach here and never touch
                 // upstream. `get_cached_artifact` re-verifies checksum + body
-                // presence; a missing/poisoned body degrades to Miss (B6).
-                match self.get_cached_artifact(cache_key, metadata_key).await? {
+                // presence against the SAME sidecar the freshness evaluation
+                // just loaded (#3951 — previously a second, LRU-bypassing
+                // storage read of the same `__cache_meta__.json`); a
+                // missing/poisoned body degrades to Miss (B6).
+                match self
+                    .get_cached_artifact(cache_key, metadata_key, metadata.clone())
+                    .await?
+                {
                     Some((content, content_type, content_encoding)) => Ok(CacheReadOutcome::Hit(
                         content,
                         content_type,
@@ -6447,7 +6479,8 @@ impl ProxyService {
                         .expect("fresh implies metadata present")
                         .quarantine_until,
                 )?;
-                self.get_cached_artifact(&cache_key, &metadata_key).await
+                self.get_cached_artifact(&cache_key, &metadata_key, metadata)
+                    .await
             }
             // Miss / NegativeHit / Stale: no upstream contact here — the caller
             // falls through to its own (parallel) upstream fetch.
@@ -6483,7 +6516,7 @@ impl ProxyService {
             RevalidationVerdict::Refill => Ok(CacheReadOutcome::Miss),
             RevalidationVerdict::ServeRevalidated => {
                 match self
-                    .get_stale_cached_artifact(cache_key, metadata_key)
+                    .get_stale_cached_artifact(cache_key, metadata_key, Some(metadata.clone()))
                     .await
                 {
                     Ok(Some((content, content_type, content_encoding))) => {
@@ -6500,7 +6533,7 @@ impl ProxyService {
             }
             RevalidationVerdict::ServeStaleIfError => {
                 if let Ok(Some((content, content_type, content_encoding))) = self
-                    .get_stale_cached_artifact(cache_key, metadata_key)
+                    .get_stale_cached_artifact(cache_key, metadata_key, Some(metadata.clone()))
                     .await
                 {
                     return Ok(CacheReadOutcome::Hit(
@@ -6690,9 +6723,10 @@ impl ProxyService {
         cache_key: &str,
         metadata_key: &str,
         allow_stale: bool,
+        preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
         self.cache_store
-            .get(cache_key, metadata_key, allow_stale)
+            .get(cache_key, metadata_key, allow_stale, preloaded_metadata)
             .await
     }
 
@@ -7046,8 +7080,10 @@ impl ProxyService {
         &self,
         cache_key: &str,
         metadata_key: &str,
+        preloaded_metadata: Option<CacheMetadata>,
     ) -> Result<Option<CachedBody>> {
-        self.get_cached(cache_key, metadata_key, true).await
+        self.get_cached(cache_key, metadata_key, true, preloaded_metadata)
+            .await
     }
 
     /// Check if upstream ETag has changed (returns true if changed/newer).
@@ -13431,6 +13467,7 @@ mod tests {
             .get_cached_artifact(
                 "proxy-cache/npm-proxy/lodash/__content__",
                 "proxy-cache/npm-proxy/lodash/__cache_meta__.json",
+                None,
             )
             .await;
 
@@ -13487,6 +13524,7 @@ mod tests {
             .get_cached_artifact(
                 "proxy-cache/npm-proxy/lodash/__content__",
                 "proxy-cache/npm-proxy/lodash/__cache_meta__.json",
+                None,
             )
             .await;
 
@@ -15875,7 +15913,10 @@ mod tests {
             KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
             KeyResponse::Bytes(Bytes::from_static(body)),
         );
-        let out = svc.get_cached(BODY_KEY, META_KEY, false).await.unwrap();
+        let out = svc
+            .get_cached(BODY_KEY, META_KEY, false, None)
+            .await
+            .unwrap();
         assert!(out.is_none(), "fresh read must reject an expired entry");
     }
 
@@ -15887,7 +15928,10 @@ mod tests {
             KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
             KeyResponse::Bytes(Bytes::from_static(body)),
         );
-        let out = svc.get_cached(BODY_KEY, META_KEY, true).await.unwrap();
+        let out = svc
+            .get_cached(BODY_KEY, META_KEY, true, None)
+            .await
+            .unwrap();
         let (content, ct, _enc) = out.expect("stale read must serve an expired entry");
         assert_eq!(&content[..], body);
         assert_eq!(ct.as_deref(), Some("application/octet-stream"));
@@ -15909,7 +15953,7 @@ mod tests {
         );
         assert!(
             fresh
-                .get_cached(BODY_KEY, META_KEY, false)
+                .get_cached(BODY_KEY, META_KEY, false, None)
                 .await
                 .unwrap()
                 .is_none(),
@@ -15924,7 +15968,7 @@ mod tests {
         );
         assert!(
             stale
-                .get_cached(BODY_KEY, META_KEY, true)
+                .get_cached(BODY_KEY, META_KEY, true, None)
                 .await
                 .unwrap()
                 .is_none(),
@@ -15939,14 +15983,14 @@ mod tests {
         // A metadata sidecar read error: fresh swallows -> Ok(None); stale
         // propagates -> Err.
         let fresh = service_with(KeyResponse::Error, KeyResponse::Missing);
-        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false).await;
+        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false, None).await;
         assert!(
             matches!(fresh_out, Ok(None)),
             "fresh read must swallow a metadata read error as a cache miss (B6)"
         );
 
         let stale = service_with(KeyResponse::Error, KeyResponse::Missing);
-        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true).await;
+        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true, None).await;
         assert!(
             stale_out.is_err(),
             "stale read must propagate a metadata read error"
@@ -15963,7 +16007,7 @@ mod tests {
             KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ false)),
             KeyResponse::Error,
         );
-        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false).await;
+        let fresh_out = fresh.get_cached(BODY_KEY, META_KEY, false, None).await;
         assert!(
             matches!(fresh_out, Ok(None)),
             "fresh read must swallow a body read error as a cache miss (B6)"
@@ -15974,10 +16018,62 @@ mod tests {
             KeyResponse::Bytes(get_cached_metadata(body, /* expired = */ true)),
             KeyResponse::Error,
         );
-        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true).await;
+        let stale_out = stale.get_cached(BODY_KEY, META_KEY, true, None).await;
         assert!(
             stale_out.is_err(),
             "stale read must propagate a body read error"
+        );
+    }
+
+    // --- #3951 item 2: the sidecar is read ONCE per buffered fresh hit -----
+
+    /// A buffered fresh hit used to read the same `__cache_meta__.json`
+    /// twice: once through the in-process sidecar LRU (#2301) to evaluate
+    /// freshness, and once more straight from storage inside
+    /// `CacheStore::get`, which bypassed the LRU even though the metadata was
+    /// already in hand at the call site. The body read now reuses the sidecar
+    /// the freshness evaluation loaded, so the storage backend sees exactly
+    /// one metadata read per hit.
+    #[tokio::test]
+    async fn test_buffered_fresh_hit_reads_metadata_sidecar_once_3951() {
+        // Unique keys per run: the metadata LRU is process-global, and a
+        // memoized entry from another test would make the first read free.
+        let unique = Uuid::new_v4();
+        let repo_key = format!("pypi-remote-3951-{unique}");
+        let cache_path = format!("simple/pkg3951-{unique}/pkg3951-{unique}-1.0.0-py3-none-any.whl");
+        let keys = CacheKeys::derive(&ProxyCacheScope::unscoped(), &repo_key, &cache_path)
+            .expect("valid cache keys");
+        let body = Bytes::from_static(b"wheel bytes for 3951");
+
+        let mut entries = std::collections::HashMap::new();
+        entries.insert(
+            keys.metadata.clone(),
+            get_cached_metadata(b"wheel bytes for 3951", /* expired = */ false),
+        );
+        entries.insert(keys.content.clone(), body.clone());
+        let storage = Arc::new(RecordingMapStorage {
+            entries,
+            requested: std::sync::Mutex::new(Vec::new()),
+        });
+        let svc = build_proxy_service_with_storage(storage.clone());
+        let repo = pypi_remote_repo(&repo_key);
+
+        let (content, _ct, _enc) = svc
+            .fetch_artifact_with_cache_path(&repo, &cache_path, &cache_path)
+            .await
+            .expect("a fresh immutable cache hit must serve without upstream");
+        assert_eq!(content, body);
+
+        let requested = storage.requested.lock().unwrap();
+        let metadata_reads = requested
+            .iter()
+            .filter(|k| k.as_str() == keys.metadata)
+            .count();
+        assert_eq!(
+            metadata_reads, 1,
+            "a buffered fresh hit must read the metadata sidecar exactly once, \
+             not {metadata_reads} times; requested: {:?}",
+            *requested
         );
     }
 
@@ -15992,7 +16088,10 @@ mod tests {
             KeyResponse::Missing,
         );
         assert!(
-            matches!(fresh.get_cached(BODY_KEY, META_KEY, false).await, Ok(None)),
+            matches!(
+                fresh.get_cached(BODY_KEY, META_KEY, false, None).await,
+                Ok(None)
+            ),
             "fresh: missing body is a miss, not an error"
         );
 
@@ -16001,7 +16100,10 @@ mod tests {
             KeyResponse::Missing,
         );
         assert!(
-            matches!(stale.get_cached(BODY_KEY, META_KEY, true).await, Ok(None)),
+            matches!(
+                stale.get_cached(BODY_KEY, META_KEY, true, None).await,
+                Ok(None)
+            ),
             "stale: missing body is a miss, not an error"
         );
     }
