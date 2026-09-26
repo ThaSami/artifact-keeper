@@ -922,10 +922,37 @@ pub async fn proxy_post_json_uncached_capped_budgeted(
     }
 }
 
+/// Outcome of a capped buffered-metadata GET, keeping the byte-ceiling abort
+/// distinguishable from every other upstream failure — the GET sibling of
+/// [`CappedMetadataPost`] (#4149).
+///
+/// The ceiling abort is a statement about the *size* of what upstream would
+/// have sent, not a fault: a handler with a streaming fallback must be able
+/// to act on it without re-deriving the cause from a rendered response (and
+/// silently reclassifying a genuine upstream 404/503 as "too large"). Every
+/// other failure therefore stays a rendered `Response`.
+pub enum CappedMetadataGet {
+    Buffered {
+        content: Bytes,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        budget_permit: OwnedSemaphorePermit,
+    },
+    /// Upstream exceeded `max`; nothing past the ceiling was ever buffered,
+    /// and no truncated body was persisted (the capped read aborts BEFORE any
+    /// cache write — see `ProxyService::read_upstream_response_capped`).
+    OverCap,
+}
+
 /// As [`proxy_fetch_capped_budgeted`], but also reports the upstream
 /// `Content-Encoding` for handlers that forward the buffered bytes to the client
 /// and must declare the coding — see
 /// [`proxy_fetch_capped_with_cache_key_and_accept_encoded`].
+///
+/// The byte-ceiling abort is reported as [`CappedMetadataGet::OverCap`] instead
+/// of a rendered 502, so a handler with a streaming fallback for oversized
+/// documents (conda repodata, #4149) can branch on it; a handler without one
+/// renders the same 502 the pre-#4149 helper produced.
 pub async fn proxy_fetch_capped_budgeted_with_encoding(
     proxy_service: &ProxyService,
     repo_id: Uuid,
@@ -933,21 +960,22 @@ pub async fn proxy_fetch_capped_budgeted_with_encoding(
     upstream_url: &str,
     path: &str,
     max: usize,
-) -> Result<(Bytes, Option<String>, Option<String>, OwnedSemaphorePermit), Response> {
-    let permit = proxy_metadata_budget().reserve(max).await;
-    let (content, content_type, content_encoding) =
-        proxy_fetch_capped_with_cache_key_and_accept_encoded(
-            proxy_service,
-            repo_id,
-            repo_key,
-            upstream_url,
-            path,
-            path,
-            None,
-            max,
-        )
-        .await?;
-    Ok((content, content_type, content_encoding, permit))
+) -> Result<CappedMetadataGet, Response> {
+    let budget_permit = proxy_metadata_budget().reserve(max).await;
+    let repo = build_remote_repo(repo_id, repo_key, upstream_url);
+    match proxy_service
+        .fetch_artifact_with_cache_path_and_accept_capped(&repo, path, path, None, max)
+        .await
+    {
+        Ok((content, content_type, content_encoding)) => Ok(CappedMetadataGet::Buffered {
+            content,
+            content_type,
+            content_encoding,
+            budget_permit,
+        }),
+        Err(error) if is_over_cap_error(&error) => Ok(CappedMetadataGet::OverCap),
+        Err(error) => Err(map_proxy_error(repo_key, path, error)),
+    }
 }
 
 /// Budget-reserving sibling of [`proxy_fetch_capped_with_cache_key_and_accept`]
