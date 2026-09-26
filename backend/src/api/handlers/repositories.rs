@@ -53,34 +53,33 @@ fn require_auth(auth: Option<AuthExtension>) -> Result<AuthExtension> {
     auth.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
 }
 
-/// Coerce the requested `is_public` value against the server-wide guest-access
-/// policy (issue #850).
+/// Refuse a request that asks for a public repository while guest access is
+/// disabled server-wide (#3855).
 ///
-/// When guest access is disabled, public repositories are meaningless: anonymous
-/// users will never reach them. We therefore silently coerce `true` to `false`
-/// on create/update so the persisted state matches the runtime policy. Returns
-/// the value to persist, plus a flag indicating whether coercion happened so
-/// the caller can emit a structured `tracing::warn!` log.
-fn coerce_is_public_for_create(requested: bool, guest_access_enabled: bool) -> (bool, bool) {
+/// `AK_GUEST_ACCESS_ENABLED=false` is a deliberate operator decision, and a
+/// create/update asking for `is_public = true` contradicts it — a
+/// configuration mistake on one side or the other. Historically the request
+/// was silently rewritten to private (issue #850): the caller got a `201`/
+/// `200` for a repository shaped differently from the one it asked for,
+/// which produced perpetual Terraform drift ("is_public flips on every
+/// plan") and late "why can nobody pull this anonymously" surprises with no
+/// connection to the create call. Reject the contradiction instead (400),
+/// matching how the neighbouring `visibility`/`is_public` conflict is
+/// already a 400 rather than a silent resolution.
+///
+/// `requested` is the payload's effective `is_public` (`allow_anonymous_access`
+/// already folded in). For updates, pass `false` when the field is absent —
+/// leaving visibility unchanged is never a contradiction.
+fn require_public_visibility_allowed(requested: bool, guest_access_enabled: bool) -> Result<()> {
     if requested && !guest_access_enabled {
-        (false, true)
-    } else {
-        (requested, false)
+        return Err(AppError::Validation(
+            "guest access is disabled on this instance (AK_GUEST_ACCESS_ENABLED=false); \
+             repositories cannot be public. Enable guest access, or choose a non-public \
+             visibility."
+                .to_string(),
+        ));
     }
-}
-
-/// Update-side counterpart of [`coerce_is_public_for_create`]. The update
-/// payload uses `Option<bool>` because callers can leave the flag unchanged;
-/// only an explicit `Some(true)` is coerced.
-fn coerce_is_public_for_update(
-    requested: Option<bool>,
-    guest_access_enabled: bool,
-) -> (Option<bool>, bool) {
-    if matches!(requested, Some(true)) && !guest_access_enabled {
-        (Some(false), true)
-    } else {
-        (requested, false)
-    }
+    Ok(())
 }
 
 /// Check that the authenticated user can access a specific repository.
@@ -466,7 +465,25 @@ pub(crate) async fn require_visible(
                 Err(not_found())
             }
         }
-        None => Err(not_found()),
+        // #1849: an anonymous caller may hold an anonymous read rule on this
+        // non-public repository — the IP-restricted CI download grant —
+        // evaluated against the in-flight request's client IP. A denial
+        // collapses to the same existence-hiding 404 as before, so a caller
+        // outside the CIDRs cannot tell a conditioned repo from a rules-less
+        // or nonexistent one; a lookup error fails CLOSED (denied, not
+        // served), matching the anonymous arms in the native-format
+        // middleware and the OCI read resolver.
+        None => {
+            let granted = repo_service
+                .anonymous_can_read_repo(repo.id)
+                .await
+                .unwrap_or(false);
+            if granted {
+                Ok(())
+            } else {
+                Err(not_found())
+            }
+        }
     }
 }
 
@@ -2917,18 +2934,14 @@ pub async fn create_repository(
         }
     }
 
-    // Issue #850: silently coerce `is_public` to false when guest access is
-    // disabled server-wide so the persisted state matches the runtime policy.
-    let (is_public, coerced) = coerce_is_public_for_create(
+    // #3855: a public repository contradicts a server-wide guest-access
+    // disable; refuse it explicitly rather than silently creating a private
+    // one the caller never asked for.
+    require_public_visibility_allowed(
         payload.effective_is_public(),
         state.config.guest_access_enabled,
-    );
-    if coerced {
-        tracing::warn!(
-            repo_key = %payload.key,
-            "Coercing repository to private: AK_GUEST_ACCESS_ENABLED=false disables public repos"
-        );
-    }
+    )?;
+    let is_public = payload.effective_is_public();
 
     let repo = service
         .create(ServiceCreateRepoReq {
@@ -3805,19 +3818,15 @@ pub async fn update_repository(
         }
     }
 
-    // Issue #850: ignore any attempt to flip a repository back to public when
-    // guest access is disabled. The web UI hides the toggle, but API clients
-    // and stale forms may still send `true`.
-    let (effective_is_public, coerced) = coerce_is_public_for_update(
-        payload.effective_is_public(),
+    // #3855: flipping a repository to public contradicts a server-wide
+    // guest-access disable; refuse it explicitly rather than silently keeping
+    // the repository private while answering 200. An absent field leaves
+    // visibility unchanged and is never a contradiction.
+    require_public_visibility_allowed(
+        payload.effective_is_public().unwrap_or(false),
         state.config.guest_access_enabled,
-    );
-    if coerced {
-        tracing::warn!(
-            repo_key = %key,
-            "Ignoring is_public=true on update: AK_GUEST_ACCESS_ENABLED=false disables public repos"
-        );
-    }
+    )?;
+    let effective_is_public = payload.effective_is_public();
 
     let repo = service
         .update(
@@ -15223,8 +15232,11 @@ mod tests {
     // xtenant-write-authz-systemic: behavioral coverage for the two shared
     // tenant gates (`require_repo_write_access` / `require_visible`) that every
     // repository sub-resource handler now routes through. The no-DB
-    // short-circuits (token scope, public, admin, anonymous) run everywhere;
-    // the per-repo role-assignment branch is exercised by the `*_db` tests,
+    // short-circuits (token scope, public, admin) run everywhere; the
+    // anonymous-on-private denial now consults the permissions store for an
+    // anonymous read rule (#1849) and must fail CLOSED when it is
+    // unreachable — the dead pool below drives exactly that. The per-repo
+    // role-assignment branch is exercised by the `*_db` tests,
     // which seed a real Postgres and skip cleanly when DATABASE_URL is unset
     // (the same `try_pool()` convention the virtual-member tests use).
     // -----------------------------------------------------------------------
@@ -17998,9 +18010,12 @@ mod tests {
     // model (role_assignments) for private repositories, so the cases that
     // exercise the DB grant lookup (private + authenticated non-admin) are
     // covered by integration/live verification rather than these pure tests.
-    // The cases below short-circuit BEFORE any DB access (public repos, the
-    // anonymous-on-private denial, and the token-scope mismatch denial) and so
-    // remain DB-free; we drive them with an unused pool handle.
+    // The public-repo and token-scope cases below short-circuit BEFORE any DB
+    // access and so remain DB-free; the anonymous-on-private denial now
+    // CONSULTS the permissions store for an anonymous read rule (#1849) and
+    // fails CLOSED when it is unreachable — which is exactly what the
+    // unused pool handle below drives: the denial must stay the
+    // existence-hiding NotFound, never a 500.
 
     #[tokio::test]
     async fn test_require_visible_public_no_auth() {
@@ -19551,66 +19566,40 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Guest-access coercion (issue #850)
+    // Guest-access public-visibility denial (#3855)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn coerce_create_passthrough_when_guests_enabled() {
-        // When guests are enabled (the default), the requested value is
-        // returned unchanged regardless of whether it is true or false.
-        assert_eq!(coerce_is_public_for_create(true, true), (true, false));
-        assert_eq!(coerce_is_public_for_create(false, true), (false, false));
+    fn public_visibility_allowed_when_guests_enabled() {
+        assert!(require_public_visibility_allowed(true, true).is_ok());
+        assert!(require_public_visibility_allowed(false, true).is_ok());
     }
 
     #[test]
-    fn coerce_create_forces_private_when_guests_disabled() {
-        assert_eq!(coerce_is_public_for_create(true, false), (false, true));
+    fn public_visibility_rejected_when_guests_disabled() {
+        // The core #3855 contract: asking for public while guest access is
+        // disabled is a 400 naming both resolutions, never a silent rewrite.
+        let err = require_public_visibility_allowed(true, false).unwrap_err();
+        match err {
+            AppError::Validation(msg) => {
+                assert!(
+                    msg.contains("AK_GUEST_ACCESS_ENABLED=false"),
+                    "message must name the operator switch: {msg}"
+                );
+                assert!(
+                    msg.contains("cannot be public"),
+                    "message must say what was refused: {msg}"
+                );
+            }
+            other => panic!("Expected Validation error, got: {:?}", other),
+        }
     }
 
     #[test]
-    fn coerce_create_already_private_is_noop_when_guests_disabled() {
-        // No coercion needed when the request is already private; the flag
-        // returned in `.1` must be `false` so the caller does not log a
-        // misleading warning.
-        assert_eq!(coerce_is_public_for_create(false, false), (false, false));
-    }
-
-    #[test]
-    fn coerce_update_passthrough_when_guests_enabled() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(true), true),
-            (Some(true), false)
-        );
-        assert_eq!(
-            coerce_is_public_for_update(Some(false), true),
-            (Some(false), false)
-        );
-        assert_eq!(coerce_is_public_for_update(None, true), (None, false));
-    }
-
-    #[test]
-    fn coerce_update_forces_private_when_guests_disabled_and_some_true() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(true), false),
-            (Some(false), true)
-        );
-    }
-
-    #[test]
-    fn coerce_update_some_false_is_noop_when_guests_disabled() {
-        assert_eq!(
-            coerce_is_public_for_update(Some(false), false),
-            (Some(false), false)
-        );
-    }
-
-    #[test]
-    fn coerce_update_none_is_noop_when_guests_disabled() {
-        // An update payload that does not touch the visibility field must
-        // remain `None` so the service layer leaves the existing value
-        // untouched. We never silently flip an existing public repo to
-        // private on unrelated updates.
-        assert_eq!(coerce_is_public_for_update(None, false), (None, false));
+    fn private_request_is_not_a_contradiction_when_guests_disabled() {
+        // Asking for (or leaving) private visibility never contradicts the
+        // policy — this includes the update path's absent-field `false`.
+        assert!(require_public_visibility_allowed(false, false).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -22895,6 +22884,247 @@ mod tests {
             b.extend(o);
         }
         Bytes::from(serde_json::to_vec(&base).expect("serialize create-repo payload"))
+    }
+
+    // -----------------------------------------------------------------------
+    // #3855: public create/update while guest access is disabled is an
+    // explicit 400, never a silent rewrite to private.
+    // -----------------------------------------------------------------------
+
+    /// Create with `is_public: true` under `AK_GUEST_ACCESS_ENABLED=false`
+    /// must be rejected with the Validation error naming the switch, and must
+    /// leave NO repository row behind; a private create under the same policy
+    /// succeeds (control).
+    #[tokio::test]
+    async fn public_create_is_rejected_when_guest_access_is_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-3855-c-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
+            cfg.guest_access_enabled = false;
+        });
+        let admin = admin_auth(user_id, &username);
+
+        let key = format!("ph-3855-pub-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &key,
+                "public repo",
+                "generic",
+                serde_json::json!({ "is_public": true }),
+            ),
+        )
+        .await
+        .expect_err("public create under AK_GUEST_ACCESS_ENABLED=false must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("AK_GUEST_ACCESS_ENABLED=false")),
+            "expected the guest-access Validation error, got {err:?}",
+        );
+        let orphaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repositories WHERE key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("count repositories");
+        assert_eq!(
+            orphaned, 0,
+            "a rejected create must not persist a repository row"
+        );
+
+        // Control: a create that does not ask for public succeeds under the
+        // same policy.
+        let private_key = format!("ph-3855-priv-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &private_key,
+                "private repo",
+                "generic",
+                serde_json::json!({}),
+            ),
+        )
+        .await
+        .expect("private create under the disabled policy must succeed");
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    /// Update flipping `is_public` to true under the disabled policy is a
+    /// 400; an update that leaves the field alone succeeds, and the stored
+    /// visibility never changes under a rejected flip.
+    #[tokio::test]
+    async fn public_update_is_rejected_when_guest_access_is_disabled() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-3855-u-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state_with(pool.clone(), storage_dir.to_str().unwrap(), |cfg| {
+            cfg.guest_access_enabled = false;
+        });
+        let admin = admin_auth(user_id, &username);
+
+        // Seed a private repository through the handler-level create.
+        let key = format!("ph-3855-upd-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(&key, "repo to flip", "generic", serde_json::json!({})),
+        )
+        .await
+        .expect("seed private repository");
+
+        let flip: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"is_public": true}"#).expect("deserialize flip payload");
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Json(flip),
+        )
+        .await
+        .expect_err("flipping is_public to true under the disabled policy must be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("AK_GUEST_ACCESS_ENABLED=false")),
+            "expected the guest-access Validation error, got {err:?}",
+        );
+        let persisted: bool =
+            sqlx::query_scalar("SELECT is_public FROM repositories WHERE id = $1")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .expect("read persisted visibility");
+        assert!(
+            !persisted,
+            "a rejected flip must leave the stored visibility untouched"
+        );
+
+        // Control: an update that leaves visibility alone succeeds.
+        let noop: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"description": "still private"}"#)
+                .expect("deserialize noop payload");
+        update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(key.clone()),
+            Json(noop),
+        )
+        .await
+        .expect("an update that does not touch visibility must succeed");
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // #1849: the anonymous arm of `require_visible` — an IP-conditioned
+    // anonymous read rule admits matching anonymous callers to a private
+    // repository; everyone else gets the same existence-hiding 404.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn require_visible_admits_anonymous_callers_with_a_matching_ip_rule() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use crate::api::middleware::client_ip::with_client_ip_scope;
+        use axum::extract::{Extension, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("ph-1849-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+
+        // Seed a private repository through the handler-level create.
+        let key = format!("ph-1849-{}", Uuid::new_v4().simple());
+        let Json(created) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin)),
+            make_create_request(&key, "ip gated repo", "generic", serde_json::json!({})),
+        )
+        .await
+        .expect("seed private repository");
+
+        let repo_service = RepositoryService::new(pool.clone());
+        let repo = repo_service
+            .get_by_id(created.id)
+            .await
+            .expect("load repository model");
+
+        // No rule yet: even a CI-range anonymous caller gets the
+        // existence-hiding 404 (control — the arm must not fall open).
+        let denied = with_client_ip_scope(
+            Some("10.40.1.1".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            matches!(denied, Err(AppError::NotFound(_))),
+            "with no anonymous rule, a private repo stays hidden from anonymous callers"
+        );
+
+        // The conditioned anonymous read rule.
+        sqlx::query(
+            "INSERT INTO permissions \
+               (principal_type, principal_id, target_type, target_id, actions, conditions) \
+             VALUES ('anonymous', $1, 'repository', $2, ARRAY['read'], $3)",
+        )
+        .bind(Uuid::nil())
+        .bind(created.id)
+        .bind(serde_json::json!({"allowed_cidrs": ["10.40.0.0/16"]}))
+        .execute(&pool)
+        .await
+        .expect("insert conditioned anonymous rule");
+
+        // Inside the CIDR: admitted.
+        let inside = with_client_ip_scope(
+            Some("10.40.1.1".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            inside.is_ok(),
+            "an anonymous caller inside allowed_cidrs must be admitted"
+        );
+
+        // Outside it: the identical existence-hiding 404 as the rules-less
+        // control above, so the caller cannot tell a conditioned repo from a
+        // rules-less one.
+        let outside = with_client_ip_scope(
+            Some("192.0.2.9".parse().unwrap()),
+            require_visible(&repo, &None, &repo_service),
+        )
+        .await;
+        assert!(
+            matches!(outside, Err(AppError::NotFound(_))),
+            "outside allowed_cidrs the denial must be the existence-hiding 404"
+        );
+
+        // No request IP (background): fail closed.
+        assert!(
+            matches!(
+                require_visible(&repo, &None, &repo_service).await,
+                Err(AppError::NotFound(_))
+            ),
+            "with no request IP a conditioned rule must fail closed"
+        );
+
+        tdh::cleanup(&pool, created.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     /// When a format string is not a built-in variant but there IS an
