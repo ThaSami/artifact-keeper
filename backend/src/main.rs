@@ -689,14 +689,15 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         });
     }
 
-    // #3647: enabling quarantine on a Remote/Virtual repository is refused at
-    // the API now, but rows written before that gate still block every uncached
-    // fetch with no release path. Warn about them once per boot; the stored
-    // config is left untouched (see `warn_unsupported_proxy_quarantine`).
+    // #3647 / #3912: enabling quarantine on a Virtual repository is refused
+    // at the API (a virtual has no cache of its own; the policy belongs on
+    // its member remotes), but rows written before that gate are dead state.
+    // Warn about them once per boot; the stored config is left untouched
+    // (see `warn_unsupported_virtual_quarantine`).
     {
         let db_pool = db_pool.clone();
         tokio::spawn(async move {
-            artifact_keeper_backend::services::quarantine_service::warn_unsupported_proxy_quarantine(
+            artifact_keeper_backend::services::quarantine_service::warn_unsupported_virtual_quarantine(
                 &db_pool,
             )
             .await;
@@ -1158,19 +1159,9 @@ pub async fn run_server(shutdown_token: Option<CancellationToken>) -> Result<()>
         .layer(axum::middleware::from_fn(
             artifact_keeper_backend::api::middleware::security_headers::security_headers_middleware,
         ))
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
-                let uri = request.uri();
-                let sanitized =
-                    artifact_keeper_backend::api::redact_sensitive_params(uri.path(), uri.query());
-                tracing::info_span!(
-                    "http_request",
-                    method = %request.method(),
-                    uri = %sanitized,
-                    correlation_id = tracing::field::Empty,
-                )
-            }),
-        );
+        .layer(TraceLayer::new_for_http().make_span_with(
+            artifact_keeper_backend::api::middleware::tracing::make_http_request_span,
+        ));
 
     // The concrete shutdown token used by all servers and background tasks
     // is resolved earlier in run_server (see `runtime_shutdown_token`) so
@@ -2660,6 +2651,7 @@ async fn load_active_plugins(
     Ok(plugins)
 }
 
+#[cfg(ak_test_shard = "services-2")]
 #[cfg(test)]
 mod tests {
     use super::*;

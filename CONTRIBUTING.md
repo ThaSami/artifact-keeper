@@ -10,8 +10,9 @@ Thanks for your interest in contributing! Here's how to get started.
 4. Create a feature branch: `git checkout -b feat/your-feature` (use `fix/`, `chore/`, or `docs/` as appropriate)
 5. Make your changes
 6. Run the same checks CI runs (see [What CI checks](#what-ci-checks))
-7. Commit and push to your fork
-8. Open a Pull Request against `main`, referencing an issue (`Closes #N`)
+7. If the change is user-facing, add a CHANGELOG fragment (see [Changelog entries](#changelog-entries))
+8. Commit and push to your fork
+9. Open a Pull Request against `main`, referencing an issue (`Closes #N`)
 
 ## Git hooks
 
@@ -37,20 +38,41 @@ related workflows) enforces, in order of how fast you can reproduce each locally
 | Formatting | `cargo fmt --all -- --check` | `cargo fmt --all -- --check` (pre-commit hook) |
 | Lint | `cargo clippy --workspace --all-targets -- -D warnings` | same command |
 | Migration slots | migration files must have unique numeric prefixes | `ls backend/migrations/ \| tail` |
-| Unit tests | `cargo test --workspace --lib` | same command (pre-push hook) |
-| Shell tests | dtrack-init regression test | `./docker/test-init-dtrack.sh` |
-| Coverage floor | `cargo llvm-cov --workspace --lib --fail-under-lines 50` | `cargo llvm-cov --workspace --lib --summary-only` |
+| Unit tests | `cargo nextest run --workspace --lib --bins`, split into test shards (one instrumented build per shard, GitHub-hosted matrix; see TESTING.md "Test shards") | `cargo nextest run --workspace --lib --test-threads 8` (see CLAUDE.md); one shard: add `--features test-shard-<name>` |
+| Shell tests | `scripts/ci/test-*.sh`, the CHANGELOG/workflow gates, dtrack-init | `for t in scripts/ci/test-*.sh; do bash "$t"; done` |
+| Coverage floor | 50% of lines, read from the shards' merged `lcov.info` in the hosted `coverage-gates` job (PRs only, advisory) | `cargo llvm-cov --workspace --lib --summary-only` |
 | New-code coverage | new/changed lines must be >= 70% covered (skipped under 10 new lines) | add tests for the lines you changed |
 | Duplication | jscpd over changed `.rs` files, <= 3% | `jscpd --min-lines 10 --threshold 3 --format rust <files>` |
-| Integration tests | `cargo test --workspace` (needs Postgres) | `./scripts/dev.sh start` then `cargo test --workspace` |
+| Integration tests | `#[ignore]`d `backend/tests/*` suites, run in Backend Integration Tests on pushes and backend-touching PRs | `./scripts/dev.sh start` then `cargo nextest run --workspace --run-ignored ignored-only --test <name>` |
 | Smoke E2E | docker compose up + smoke profile | `./scripts/run-e2e-tests.sh` |
 | Security audit | `cargo audit` on the dependency tree | `cargo audit` |
 | Linked issue | PR body must reference an issue (`Closes #N`) | n/a (PR body) |
+| CHANGELOG fragments | every `changes/unreleased/*.md` is well-formed | `python3 scripts/ci/changelog-fragments.py validate` |
 | CodeQL | static analysis | n/a (runs in CI) |
 
 The fmt/clippy/unit-test gates are the ones the hooks cover. The coverage, duplication, and
 linked-issue gates run only in CI, so check those before pushing a large change. Do not use
 "push and see if CI passes" as a workflow, and do not bypass a failing gate with `--admin`.
+
+## Changelog entries
+
+Do not edit `CHANGELOG.md`. Each PR with a user-facing change adds **one new file**
+`changes/unreleased/<issue-or-pr-number>-<slug>.md`, so no two PRs touch the same file and
+merging one PR does not put every other open PR into conflict:
+
+```markdown
+---
+section: Fixed
+issues: [#1234]
+---
+- **What changed, in one bold sentence** (#1234). Why it was wrong and what the fix does.
+```
+
+`section` is one of `Added`, `Changed`, `Deprecated`, `Removed`, `Fixed`, `Security`. The
+body is exactly the bullet as it would read in `CHANGELOG.md`, and it must cite the issues
+listed in `issues`. Full rules: [changes/README.md](changes/README.md). The maintainers
+assemble the fragments into `CHANGELOG.md` when a release is cut. CI-only changes need no
+fragment.
 
 ## Development Setup
 
@@ -70,7 +92,7 @@ docker compose up -d postgres opensearch
 cargo run
 
 # Run tests
-cargo test --workspace --lib
+cargo nextest run --workspace --lib --test-threads 8
 ```
 
 ## What to Contribute

@@ -32,10 +32,14 @@ Tier 1 also runs every integration target whose tests are **not** `#[ignore]`d
 (workflow contract tests, security regression pins, the streaming-invariant
 ratchet, PyPI conformance): see the "Run workflow contract and pure
 integration targets" step in `.github/workflows/ci.yml`. They cannot go in the
-Tier 2 allowlist below: that job runs `-- --ignored`, and non-`#[ignore]`d
-tests would report `0 tests` and pass.
+Tier 2 allowlist below: that step runs `--run-ignored ignored-only`, and
+non-`#[ignore]`d tests would report `0 tests` and pass.
 
-### Integration Tests (Tier 2) - Main/Release Pushes & Backend PRs
+The unit-test job is also the coverage run: it builds once with `cargo llvm-cov`
+instrumentation, runs the suite once, and uploads `lcov.info`; the
+`📊 Code Coverage` job only evaluates the gates from that report.
+
+### Integration Tests (Tier 2) - Pushes & Backend PRs
 
 CI names an explicit list of test files and runs their `#[ignore]`d cases
 serially. Every `backend/tests/*.rs` file MUST be either named in a `--test`
@@ -46,18 +50,22 @@ ones that need live cloud credentials or a running HTTP backend.
 
 ```bash
 # Backend integration tests (requires PostgreSQL)
-cargo test --workspace --verbose --test <test_file_name> -- --ignored --test-threads=1
+cargo nextest run --workspace --run-ignored ignored-only --test <test_file_name>
 ```
+
+They run one at a time: `.config/nextest.toml` puts every integration target
+(`kind(test)`) in the single-threaded `db-serial` test group, because the
+suites share schema state through global DELETEs.
 
 **Validating locally: DB-backed tests SKIP silently without `DATABASE_URL`.**
 They report PASS in ~0.0x seconds (0.04s / 0.01s) without executing anything.
 A sub-0.1s "pass" on a DB suite means it did not run. Always export
 `AK_TESTS_REQUIRE_DB=1` alongside `DATABASE_URL` when you need proof a test
 ran — it turns a missing/unreachable database into a hard failure (#2924).
-CI runs this suite on pushes to `main` / `release/*` **and** on every pull
-request that touches `backend/**`, `Cargo.toml`, `Cargo.lock`, `.sqlx/**`, or
-`.github/workflows/ci.yml`. On such a PR a skipped integration job fails
-`✅ CI Complete` (#3124).
+CI runs this suite in the `🧪 Backend Integration Tests` job on every push
+**and** on every pull request that touches `backend/**`, `Cargo.toml`,
+`Cargo.lock`, `.sqlx/**`, or `.github/workflows/ci.yml` (#3124). A failure
+there fails the required `🧪 Backend Unit Tests` check.
 
 ### Full E2E Tests (Tier 3) - Release/Manual Only
 ```bash
@@ -244,8 +252,8 @@ cargo clippy --workspace --all-targets -- -D warnings      # linting
 cargo nextest run --workspace --lib --test-threads 8       # unit tests
 ```
 
-**Use `cargo nextest`, not plain `cargo test`.** That is the runner both CI
-unit-test jobs invoke (`.github/workflows/ci.yml`), and the difference is
+**Use `cargo nextest`, not plain `cargo test`.** That is the runner the CI
+unit-test job invokes (`.github/workflows/ci.yml`), and the difference is
 load-bearing rather than cosmetic: nextest runs each test in its own process,
 and a number of unit tests depend on that isolation because they touch
 process-global state (upload semaphores, proxy environment variables) or are
@@ -318,6 +326,25 @@ Long-lived `release/X.Y.x` branches exist for shipping bug fixes to older releas
 - The release workflow is at `.github/workflows/release.yml`, triggered by `v*` tags.
 - The release-gate (artifact-keeper-test) must pass for a release to be published. If gates fail, the release is created as a **draft** with binaries attached but not published.
 
+### Changelog entries: one fragment file per PR
+
+**Do not edit `CHANGELOG.md` in a feature or fix PR.** Add one new file,
+`changes/unreleased/<issue-or-pr-number>-<slug>.md` (format and rules in
+`changes/README.md`):
+
+```markdown
+---
+section: Fixed            # Added | Changed | Deprecated | Removed | Fixed | Security
+issues: [#4145, #4129]
+---
+- **Bold lead sentence saying what changed for the user** (#4145, #4129). The why and the what, exactly as the bullet would read in CHANGELOG.md; further paragraphs indented two spaces.
+```
+
+- Lead with the issue the PR closes: release preflight check 5 reconciles each entry by the first `#N` on its `- ` line.
+- One fragment per user-facing change; CI-only / workflow-only changes need none.
+- `python3 scripts/ci/changelog-fragments.py validate` checks every fragment; CI runs it in `check-changelog-unreleased.sh`.
+- The release prep renders the fragments into `## [X.Y.Z] - <date>` with `scripts/release/assemble-changelog.sh` and deletes them (RELEASING.md step 3). A bullet added under `## [Unreleased]` still passes CI during the transition and is merged at the cut, but it conflicts with every other PR doing the same, which is why fragments replaced it.
+
 ### Changelog and Release Notes
 
 Every CHANGELOG entry and GitHub Release must include recognition sections. This is required for every release, no exceptions.
@@ -332,6 +359,8 @@ Every CHANGELOG entry and GitHub Release must include recognition sections. This
 7. **Do NOT include maintainer `brandonrc`** in the thank you section, only external contributors
 8. If no external contributors reported issues for this release, omit the Thank You section
 9. The Sponsors section is always included if there are active sponsors
+
+The recognition sections are added to the assembled `## [X.Y.Z]` section in the release prep PR, not to fragments.
 
 **Example format in CHANGELOG.md:**
 ```markdown

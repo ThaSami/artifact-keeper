@@ -8,8 +8,8 @@ The artifact-keeper backend uses a multi-tier testing strategy covering unit tes
 
 | Test Type | Framework | Count | CI Job | Status |
 |-----------|-----------|-------|--------|--------|
-| Unit | cargo test --lib | ~4900 tests | `test-backend-unit` | Active |
-| Integration | cargo test --test | 61 test files (16 registered in CI) | `test-backend-integration` | Main/release only |
+| Unit | cargo nextest --lib --bins | ~17,500 tests | `test-backend-unit-shard` (matrix of test shards) | Active |
+| Integration | cargo nextest --test | 63 test files (55 run in CI, 8 exempt) | `test-backend-integration` | Pushes + backend PRs |
 | Native client E2E | Shell scripts | 28 scripts, 12 formats | `smoke-e2e` | Active |
 | Stress | Shell scripts | 100 concurrent uploads | Manual/dispatch | Active |
 | Failure injection | Shell scripts | 3 scenarios | Manual/dispatch | Active |
@@ -20,18 +20,19 @@ The artifact-keeper backend uses a multi-tier testing strategy covering unit tes
 
 ### Unit Tests (no database required)
 ```bash
-SQLX_OFFLINE=true cargo test --workspace --lib
+SQLX_OFFLINE=true cargo nextest run --workspace --lib --test-threads 8
 ```
 
 ### Single Test
 ```bash
-cargo test --workspace --lib test_name_here
+cargo nextest run --workspace --lib test_name_here
 ```
 
 ### Integration Tests (requires PostgreSQL)
 ```bash
 docker compose -f docker-compose.local-dev.yml up -d postgres
-DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" cargo test --workspace
+DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" \
+  cargo nextest run --workspace --run-ignored ignored-only --test <name>
 ```
 
 ### E2E Smoke Tests
@@ -71,15 +72,20 @@ DATABASE_URL="postgresql://registry:registry@localhost:30432/artifact_registry" 
 
 ```
 PR opened/pushed
-  -> lint-rust (cargo fmt + clippy)
-  -> test-backend-unit (cargo test --lib)
+  -> check-rust (cargo fmt + clippy)
+  -> test-backend-unit-shard (hosted matrix, one instrumented build per test
+     shard: that shard's unit tests + its lcov.info)
+     -> coverage-gates (PR only: merge the shard reports, then floor,
+        new-code and duplication gates)
+  -> test-backend-integration (PostgreSQL integration suites on
+     backend-touching changes)
+  -> test-backend-unit (required check: all shards + integration passed)
   -> smoke-e2e (PyPI, NPM, Cargo via Docker)
-  -> security-audit (cargo audit, non-blocking)
-  -> build-backend-image (Docker build, PR only)
+  -> security-audit (cargo audit)
+  -> build-backend-image (Docker build)
 
 Merge to main
-  -> All above PLUS:
-  -> test-backend-integration (with PostgreSQL)
+  -> All above (except coverage-gates) PLUS:
   -> Docker publish to ghcr.io
 ```
 
@@ -87,7 +93,6 @@ Merge to main
 
 | Gap | Recommendation | Priority |
 |-----|---------------|----------|
-| No code coverage reporting | Add `cargo-llvm-cov` to CI, target 60% | P2 |
 | No property-based testing | Add `proptest` for format parsers | P3 |
 | No fuzz testing | Add `cargo-fuzz` for upload/parse paths | P3 |
 | No contract testing | Validate OpenAPI spec against live API | P2 |

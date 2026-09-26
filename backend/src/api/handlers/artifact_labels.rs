@@ -322,6 +322,7 @@ async fn live_artifact_repository_id(db: &sqlx::PgPool, artifact_id: Uuid) -> Re
     repository_id.ok_or_else(|| AppError::NotFound(format!("Artifact {artifact_id} not found")))
 }
 
+#[cfg(ak_test_shard = "handlers-1")]
 #[cfg(test)]
 mod tests {
     use super::*;

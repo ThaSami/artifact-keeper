@@ -36,7 +36,11 @@ concurrency:
 jobs:
   cache-correctness-e2e:
     name: 🧊 Cache-correctness + virtual-resolution
-    runs-on: ubuntu-latest
+    # Self-hosted ak-e2e-runners: the stack runs in the pod's DinD daemon
+    # (docker CLI and compose plugin come with the ak-runner-e2e image), and
+    # every bind mount in the compose file is workspace-relative, which the
+    # runner and DinD containers share.
+    runs-on: ak-e2e-runners
     # The cache-correctness suite sleeps through three full mutable TTLs plus a
     # negative-TTL poll. Those waits now match the backend's compiled-in TTLs
     # (300 s / 45 s, see docker-compose.test.yml), which adds ~14 minutes of
@@ -47,7 +51,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Run virtual-resolution regression suite (#1600/#1595/#1562)
         if: ${{ github.event.inputs.suite == 'both' || github.event.inputs.suite == 'virtual-resolution' || github.event_name == 'schedule' }}
