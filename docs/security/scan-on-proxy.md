@@ -111,7 +111,8 @@ over the members the caller may read.
   error, a `502` checksum mismatch) moves on to the next member.
 - If the members' scan configuration cannot be read, the pull fails with a
   retryable `503` instead of serving unscanned.
-- On the generic download route, a Virtual repository refuses with `403` when
+- On the generic routes that serve a member's bytes (`download/*path` and
+  `artifacts/*path`), a Virtual repository refuses with `403` when
   a Remote member the caller may read would scan under the stricter-of-two
   rule. See [The generic download route](#the-generic-download-route).
 
@@ -136,7 +137,9 @@ is on (#4442):
   It applies to `HEAD` as well, so a `HEAD` can neither confirm an upstream
   file nor cost an upstream request.
 - A Virtual repository refuses the same way when a Remote member the caller
-  may read scans under the stricter-of-two rule. A hosted member that owns the
+  may read scans under the stricter-of-two rule. This also covers
+  `GET /api/v1/repositories/{key}/artifacts/*path`, which serves a Virtual
+  member's bytes through the same member walk. A hosted member that owns the
   exact path is still served.
 - If the `scan_on_proxy` flag cannot be read, the route answers `503` instead
   of serving unscanned.
@@ -201,7 +204,10 @@ have no core proxy path to gate.
 - **Cache commit before the verdict.** The buffered fetch commits upstream
   bytes to the proxy cache before the gate decides. A route that does not
   re-check the verdict can then serve them warm (#4365). The generic download
-  route refuses before it reads the cache, so it is not one of them.
+  route refuses before it reads the cache for a repository that scans on
+  proxy. A non-scanning Remote member of a scanning Virtual is still subject
+  to this gap: bytes the Virtual refused can be served warm by addressing the
+  member directly, on its format route or on the generic route.
 - **Unreadable configuration on a direct Remote pull.** If a Remote
   repository's `scan_on_proxy` flag cannot be read, a format route serves the
   pull as if scanning were off (#4365). The Virtual walk and the generic

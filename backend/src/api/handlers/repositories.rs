@@ -8547,14 +8547,28 @@ pub async fn get_artifact_metadata(
         } else {
             state.proxy_service.as_deref()
         };
+        // #4442: this route streams a member's BYTES like `download_artifact`,
+        // so it takes the same check: the caller-authorized members, then a
+        // refusal when the shadowing guard left Remote members in play and one
+        // of them scans on proxy.
+        let not_found =
+            || AppError::NotFound("Artifact not found in any member repository".to_string());
+        let members = proxy_helpers::authorized_virtual_members(&state.db, auth.as_ref(), repo.id)
+            .await
+            .map_err(|_| not_found())?;
+        if proxy_for_virtual.is_some() {
+            if let Some(refusal) =
+                generic_route_virtual_refusal(&state.db, &repo, &members, &path).await
+            {
+                return Ok(refusal);
+            }
+        }
         let db = state.db.clone();
         let path_clone = path.clone();
         let state_clone = state.clone();
-        let result = proxy_helpers::resolve_virtual_download(
-            &state.db,
-            auth.as_ref(),
+        let result = proxy_helpers::resolve_virtual_download_from_members(
+            members,
             proxy_for_virtual,
-            repo.id,
             &path,
             move |member_id, location| {
                 let db = db.clone();
@@ -25281,6 +25295,26 @@ mod tests {
                 < at("proxy_helpers::resolve_virtual_download_from_members("),
             "#4442: the Virtual refusal must precede the member walk"
         );
+
+        // `get_artifact_metadata` streams a Virtual member's bytes on
+        // `/artifacts/*path` and takes the same Virtual refusal first.
+        let start = src
+            .find("pub async fn get_artifact_metadata(")
+            .expect("get_artifact_metadata must exist");
+        let body = &src[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("get_artifact_metadata must end with a column-0 brace")];
+        let refusal = body
+            .find("generic_route_virtual_refusal(&state.db")
+            .expect("#4442: get_artifact_metadata must run the Virtual refusal");
+        let walk = body
+            .find("proxy_helpers::resolve_virtual_download_from_members(")
+            .expect("get_artifact_metadata must walk the authorized members");
+        assert!(
+            refusal < walk,
+            "#4442: the Virtual refusal must precede get_artifact_metadata's member walk"
+        );
     }
 
     /// A wiremock upstream that answers every GET with `body`.
@@ -25485,19 +25519,30 @@ mod tests {
             std::fs::create_dir_all(&dir).expect("cache dir");
             let state = proxy_state_4442(&pool, &dir);
 
-            let (status, body) = tdh::send(
-                tdh::router_anon(download_router(), state),
-                tdh::get(format!(
-                    "/{virtual_key}/download/left-pad/-/left-pad-1.3.0.tgz"
-                )),
-            )
-            .await;
-            if scan_on.is_some() {
-                assert_scan_route_refusal_4442(status, &body, "left-pad-1.3.0.tgz", "npm", &what);
-                assert_eq!(upstream_requests_4442(&server).await, 0, "{what}");
-            } else {
-                assert_eq!(status, StatusCode::OK, "{what}");
-                assert_eq!(&body[..], b"virtual-member-bytes", "{what}");
+            // Both generic routes that stream a member's bytes: the download
+            // route and the artifacts route (`get_artifact_metadata`).
+            for route in ["download", "artifacts"] {
+                let what = format!("{what}, /{route}/");
+                let (status, body) = tdh::send(
+                    tdh::router_anon(download_router().merge(router()), state.clone()),
+                    tdh::get(format!(
+                        "/{virtual_key}/{route}/left-pad/-/left-pad-1.3.0.tgz"
+                    )),
+                )
+                .await;
+                if scan_on.is_some() {
+                    assert_scan_route_refusal_4442(
+                        status,
+                        &body,
+                        "left-pad-1.3.0.tgz",
+                        "npm",
+                        &what,
+                    );
+                    assert_eq!(upstream_requests_4442(&server).await, 0, "{what}");
+                } else {
+                    assert_eq!(status, StatusCode::OK, "{what}");
+                    assert_eq!(&body[..], b"virtual-member-bytes", "{what}");
+                }
             }
 
             for id in [virtual_id, remote_id] {
@@ -25557,18 +25602,25 @@ mod tests {
         .await;
         let state = proxy_state_4442(&fx.pool, &fx.storage_dir);
 
-        let (status, body) = tdh::send(
-            tdh::router_anon(download_router(), state),
-            tdh::get(format!("/{}/download/vdl/blob.bin", fx.repo_key)),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-        assert_eq!(&body[..], hosted);
-        assert_eq!(
-            upstream_requests_4442(&server).await,
-            0,
-            "the Remote member is never consulted"
-        );
+        for route in ["download", "artifacts"] {
+            let (status, body) = tdh::send(
+                tdh::router_anon(download_router().merge(router()), state.clone()),
+                tdh::get(format!("/{}/{route}/vdl/blob.bin", fx.repo_key)),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "/{route}/: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(&body[..], hosted, "/{route}/");
+            assert_eq!(
+                upstream_requests_4442(&server).await,
+                0,
+                "/{route}/: the Remote member is never consulted"
+            );
+        }
 
         for (id, dir) in [(local_id, &local_dir), (remote_id, &remote_dir)] {
             tdh::cleanup_member_repo(&fx.pool, id, dir).await;
