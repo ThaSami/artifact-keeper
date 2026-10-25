@@ -29,7 +29,8 @@ the stored bundle.
 
 ## What a client sees
 
-- An object of at most 4 MiB is read and checked before anything is sent. A
+- An object of at most 4 MiB is read and checked before anything is sent,
+  while the verification memory budget has room (see [Cost](#cost)). A
   mismatch is answered `502 Bad Gateway` with
   `{"code": "STORED_OBJECT_INTEGRITY", ...}` and none of the object's bytes.
   Through a virtual repository the 502 is final: the walk does not fall
@@ -48,8 +49,13 @@ the stored bundle.
 Every checked serve hashes the bytes it sends (SHA-256, one pass, no second
 read of the object). An object of at most 4 MiB is held in memory until it has
 been checked, so its first byte leaves only after its last byte was read, and
-each such serve in flight holds up to 4 MiB. A larger object streams with one
-chunk held back. Virtual-repository `HEAD` requests that resolve through a
+it stays in memory until the client has read it. Those buffers share one
+process-wide budget, `AK_SERVE_VERIFY_BUFFER_BUDGET_BYTES` (default 256 MiB,
+#4989). When it is full, a small object streams and is checked like a large
+one: still never delivered complete if it is corrupt, but aborted instead of
+answered `502`. The budget's metrics are in
+[load shedding](load-shedding.md#download-verification-memory-budget). A
+larger object streams with one chunk held back. Virtual-repository `HEAD` requests that resolve through a
 member walk still read a small object to check it.
 
 Each failure logs `stored object failed integrity verification on serve`
