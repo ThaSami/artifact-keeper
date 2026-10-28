@@ -5743,6 +5743,22 @@ pub async fn local_fetch_by_path(
     location: &StorageLocation,
     artifact_path: &str,
 ) -> Result<StreamingFetchResult, Response> {
+    local_fetch_by_path_verifying(db, state, repo_id, location, artifact_path, true).await
+}
+
+/// [`local_fetch_by_path`] with serve-time verification optional (#4989). A
+/// caller answering a HEAD passes `verify = false`: the body is never polled,
+/// and verifying it would read up to `VERIFY_BEFORE_HEADERS_MAX_BYTES` of the
+/// object for nothing, the way a HEAD answered from the artifact row already
+/// skips it (#4323).
+pub async fn local_fetch_by_path_verifying(
+    db: &PgPool,
+    state: &AppState,
+    repo_id: Uuid,
+    location: &StorageLocation,
+    artifact_path: &str,
+    verify: bool,
+) -> Result<StreamingFetchResult, Response> {
     let (artifact, storage) = local_lookup_artifact(
         db,
         state,
@@ -5751,7 +5767,7 @@ pub async fn local_fetch_by_path(
         LocalLookup::Path(artifact_path),
     )
     .await?;
-    read_local_stream(db, &artifact, &*storage).await
+    open_local_stream(db, &artifact, &*storage, verify).await
 }
 
 /// Generic local artifact fetch by name and version.

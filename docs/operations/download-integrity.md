@@ -41,8 +41,9 @@ the stored bundle.
 - A range request for part of an object is not checked (a window cannot be
   checked against a whole-object digest); a range covering the whole object
   is.
-- A `HEAD` on the generic route, or one the shared hosted fetch answers from
-  the artifact row, reads no body and is not checked.
+- A `HEAD` on the generic route, including one a virtual repository answers
+  from a hosted member there (#4989), or one the shared hosted fetch answers
+  from the artifact row, reads no body and is not checked.
 
 ## Cost
 
@@ -55,8 +56,9 @@ process-wide budget, `AK_SERVE_VERIFY_BUFFER_BUDGET_BYTES` (default 256 MiB,
 one: still never delivered complete if it is corrupt, but aborted instead of
 answered `502`. The budget's metrics are in
 [load shedding](load-shedding.md#download-verification-memory-budget). A
-larger object streams with one chunk held back. Virtual-repository `HEAD` requests that resolve through a
-member walk still read a small object to check it.
+larger object streams with one chunk held back. Virtual-repository `HEAD`
+requests that a format route resolves through a member walk still read a
+small object to check it; on the generic route they read nothing.
 
 Each failure logs `stored object failed integrity verification on serve`
 at error level with the object, the expected and actual digest and length.
