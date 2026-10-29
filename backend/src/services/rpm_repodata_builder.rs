@@ -71,7 +71,18 @@ pub const RPM_REPODATA_BUILD_LOCK_CLASS: i32 = 0x4544;
 pub const MODE_KEY: &str = "repodata_mode";
 
 /// How a hosted RPM repository's repodata is produced.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum RepodataMode {
     /// Built in the background and served from storage (the default).
     #[default]
@@ -338,12 +349,22 @@ pub async fn try_build(
 }
 
 /// Build `root` now, waiting up to `wait` for a build another replica is
-/// running to finish first. Used by the rebuild endpoint (`wait=true`).
+/// running to finish first. Used by the rebuild endpoint (`wait=true`). When
+/// the current revision already includes every committed write (the root
+/// is clean, and no claimed build is outstanding: `retry_at` is only left
+/// set by a claim that never swapped or an incomplete build), it is
+/// returned instead of building again, so concurrent callers and retries
+/// share one build.
+///
+/// `slots` caps the builds this replica runs synchronously; a permit is
+/// taken only once the lease is held, so waiting on another replica's build
+/// does not occupy one. No free permit is a 503.
 pub async fn build_waiting(
     state: &SharedState,
     repo_id: Uuid,
     root: &str,
     wait: Duration,
+    slots: &'static tokio::sync::Semaphore,
 ) -> Result<BuildOutcome> {
     let lease = PgAdvisoryLock::new(state.db.clone())
         .acquire_blocking(
@@ -355,16 +376,37 @@ pub async fn build_waiting(
     let Some(lease) = lease else {
         return Ok(BuildOutcome::Busy);
     };
+    let current: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT built_revision, built_count FROM rpm_repodata_roots \
+          WHERE repository_id = $1 AND root = $2 AND dirty_since IS NULL \
+            AND retry_at IS NULL AND built_revision IS NOT NULL",
+    )
+    .bind(repo_id)
+    .bind(root)
+    .fetch_optional(&state.db)
+    .await?;
+    if let Some((revision, packages)) = current {
+        lease.release().await;
+        return Ok(BuildOutcome::Built { revision, packages });
+    }
+    let Ok(_permit) = slots.try_acquire() else {
+        lease.release().await;
+        return Err(AppError::ServiceUnavailable(
+            "Too many synchronous repodata rebuilds in progress; retry".into(),
+        ));
+    };
     build_leased(state, repo_id, root, &BuilderSettings::from_env(), lease).await
 }
 
-/// Ask for a build of `root` at the next tick, without the debounce.
+/// Ask for a build of `root` at the next tick, without the debounce. A root
+/// backing off after a failed build keeps its back-off.
 pub async fn request_build(db: &PgPool, repo_id: Uuid, root: &str) -> Result<()> {
     sqlx::query(
         "INSERT INTO rpm_repodata_roots (repository_id, root, dirty_since) \
          VALUES ($1, $2, 'epoch') \
          ON CONFLICT (repository_id, root) DO UPDATE SET dirty_since = 'epoch', \
-             retry_at = NULL, last_error = NULL",
+             retry_at = CASE WHEN rpm_repodata_roots.last_error IS NULL THEN NULL \
+                             ELSE rpm_repodata_roots.retry_at END",
     )
     .bind(repo_id)
     .bind(root)
@@ -415,7 +457,7 @@ async fn build_leased(
 }
 
 /// The repository's storage location when it is precomputed.
-async fn precomputed_location(db: &PgPool, repo_id: Uuid) -> Result<Option<StorageLocation>> {
+pub async fn precomputed_location(db: &PgPool, repo_id: Uuid) -> Result<Option<StorageLocation>> {
     let sql = format!(
         "SELECT r.storage_backend, r.storage_path FROM repositories r \
           WHERE r.id = $1 AND {PRECOMPUTED_REPO_SQL}"
@@ -824,6 +866,22 @@ pub async fn collect_garbage(state: &SharedState) -> Result<u64> {
         else {
             continue;
         };
+        // Recheck under the lease: the repository may have switched back to
+        // precomputed and been built since the listing.
+        let still: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM rpm_repodata_roots rr \
+               LEFT JOIN repositories r ON r.id = rr.repository_id \
+              WHERE rr.repository_id = $1 AND rr.root = $2 \
+                AND (r.id IS NULL OR NOT ({PRECOMPUTED_REPO_SQL})))"
+        )))
+        .bind(repo_id)
+        .bind(&root)
+        .fetch_one(&state.db)
+        .await?;
+        if !still {
+            lease.release().await;
+            continue;
+        }
         let result = drop_root(state, repo_id, &root).await;
         if gone && result.is_ok() {
             let _ = sqlx::query(
@@ -894,6 +952,108 @@ pub async fn mark_dirty(db: &PgPool, repo_id: Uuid, root: &str) -> Result<()> {
     .execute(db)
     .await?;
     Ok(())
+}
+
+/// Why a `repodata_mode` cannot be set on a repository.
+pub const MODE_UNSUPPORTED: &str = "repodata_mode applies to hosted (local) RPM repositories only";
+
+/// Store `mode` for `repo_id` on the writer's connection. `precomputed`, the
+/// default, is stored as the absence of the key. Switching to `on_request`
+/// takes effect on the next request; the builder's maintenance pass then
+/// deletes the stored revisions.
+pub async fn set_mode(
+    conn: &mut sqlx::PgConnection,
+    repo_id: Uuid,
+    mode: RepodataMode,
+) -> Result<()> {
+    match mode {
+        RepodataMode::Precomputed => {
+            let switched =
+                sqlx::query("DELETE FROM repository_config WHERE repository_id = $1 AND key = $2")
+                    .bind(repo_id)
+                    .bind(MODE_KEY)
+                    .execute(&mut *conn)
+                    .await?
+                    .rows_affected();
+            if switched == 0 {
+                return Ok(());
+            }
+            // Build afresh: a revision built before an opt-out is stale.
+            sqlx::query(
+                "UPDATE rpm_repodata_roots SET dirty_since = COALESCE(dirty_since, now()) \
+                  WHERE repository_id = $1",
+            )
+            .bind(repo_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        RepodataMode::OnRequest => {
+            sqlx::query(
+                "INSERT INTO repository_config (repository_id, key, value) VALUES ($1, $2, $3) \
+                 ON CONFLICT (repository_id, key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(repo_id)
+            .bind(MODE_KEY)
+            .bind(mode.as_str())
+            .execute(&mut *conn)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// The modes of the hosted RPM repositories among `ids` (other repositories
+/// are absent from the map).
+pub async fn modes(db: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, RepodataMode>> {
+    let rows: Vec<(Uuid, Option<String>)> = sqlx::query_as(
+        "SELECT r.id, c.value FROM repositories r \
+           LEFT JOIN repository_config c ON c.repository_id = r.id AND c.key = 'repodata_mode' \
+          WHERE r.id = ANY($1) AND r.format = 'rpm' AND r.repo_type = 'local'",
+    )
+    .bind(ids)
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, value)| {
+            (
+                id,
+                value
+                    .as_deref()
+                    .and_then(RepodataMode::parse)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+/// Whether a rebuild may name `root` of `repo_id`: it lists a package, or
+/// it is already tracked (it had packages, so a build that empties it must
+/// be possible). A made-up root is neither.
+pub async fn root_is_known(db: &PgPool, repo_id: Uuid, root: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM rpm_repodata_roots \
+                         WHERE repository_id = $1 AND root = $3) \
+             OR EXISTS (SELECT 1 FROM artifacts a \
+          WHERE a.repository_id = $1 AND a.is_deleted = false AND a.path LIKE '%.rpm' \
+            AND starts_with(a.path, $2))",
+    )
+    .bind(repo_id)
+    .bind(root_prefix(root))
+    .bind(root)
+    .fetch_one(db)
+    .await?)
+}
+
+/// Deserialize a present `repodata_mode`, refusing `null` (omit the field to
+/// keep the current mode).
+pub fn deserialize_mode<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<RepodataMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <RepodataMode as serde::Deserialize>::deserialize(deserializer).map(Some)
 }
 
 /// The repository's repodata mode (`repodata_mode` in `repository_config`;
