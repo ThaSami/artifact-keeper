@@ -240,7 +240,11 @@ pub struct CreateRepositoryRequest {
 pub struct UpdateRepositoryRequest {
     pub key: Option<String>,
     pub name: Option<String>,
-    pub description: Option<String>,
+    /// When `Some`, sets the description; `None` leaves it unchanged. The
+    /// outer `Option` is the "field present" marker and the inner value is
+    /// what is stored: `Some(Some(text))` sets, `Some(None)` clears the
+    /// column to NULL (#4729).
+    pub description: Option<Option<String>>,
     /// Set the repository's audience outright. `None` leaves it unchanged.
     pub visibility: Option<crate::models::repository::RepositoryVisibility>,
     /// Legacy boolean. Only ever `Some(false)` from the handler, meaning "not
@@ -248,6 +252,10 @@ pub struct UpdateRepositoryRequest {
     /// database trigger narrow a `public` repository while leaving an
     /// `internal` one alone, which writing `visibility` directly would not.
     pub is_public: Option<bool>,
+    /// When `Some`, sets the repository quota; `None` leaves it unchanged.
+    /// The outer `Option` is the "field present" marker and the inner value is
+    /// what is stored: `Some(Some(bytes))` sets, `Some(None)` clears the
+    /// column to NULL (unlimited, #4729).
     pub quota_bytes: Option<Option<i64>>,
     pub upstream_url: Option<String>,
     /// When `Some`, sets the `promotion_only` flag; `None` leaves it unchanged.
@@ -1247,7 +1255,8 @@ impl RepositoryService {
         req: CreateRepositoryRequest,
         repodata_depth: u32,
     ) -> Result<Repository> {
-        self.create_with_options(req, repodata_depth, true).await
+        self.create_with_options(req, repodata_depth, None, true)
+            .await
     }
 
     /// Create with an explicit choice about the creator's owner auto-grant.
@@ -1262,9 +1271,17 @@ impl RepositoryService {
         &self,
         req: CreateRepositoryRequest,
         repodata_depth: u32,
+        repodata_mode: Option<crate::services::rpm_repodata_builder::RepodataMode>,
         grant_owner_role: bool,
     ) -> Result<Repository> {
         crate::services::rpm_layout::validate_depth(repodata_depth)?;
+        if repodata_mode.is_some()
+            && (req.format != RepositoryFormat::Rpm || req.repo_type != RepositoryType::Local)
+        {
+            return Err(AppError::UnprocessableEntity(
+                crate::services::rpm_repodata_builder::MODE_UNSUPPORTED.into(),
+            ));
+        }
         if repodata_depth > 0
             && (req.format != RepositoryFormat::Rpm || req.repo_type != RepositoryType::Local)
         {
@@ -1432,6 +1449,9 @@ impl RepositoryService {
                 if repodata_depth > 0 {
                     crate::services::rpm_layout::set_depth(&mut tx, repo.id, repodata_depth)
                         .await?;
+                }
+                if let Some(mode) = repodata_mode {
+                    crate::services::rpm_repodata_builder::set_mode(&mut tx, repo.id, mode).await?;
                 }
                 tx.commit()
                     .await
@@ -1793,7 +1813,7 @@ impl RepositoryService {
 
     /// Update a repository
     pub async fn update(&self, id: Uuid, req: UpdateRepositoryRequest) -> Result<Repository> {
-        self.update_with_repodata_depth(id, req, None).await
+        self.update_with_repodata_depth(id, req, None, None).await
     }
 
     pub async fn update_with_repodata_depth(
@@ -1801,7 +1821,18 @@ impl RepositoryService {
         id: Uuid,
         req: UpdateRepositoryRequest,
         repodata_depth: Option<u32>,
+        repodata_mode: Option<crate::services::rpm_repodata_builder::RepodataMode>,
     ) -> Result<Repository> {
+        if repodata_mode.is_some() {
+            let existing = self.get_by_id(id).await?;
+            if existing.format != RepositoryFormat::Rpm
+                || existing.repo_type != RepositoryType::Local
+            {
+                return Err(AppError::UnprocessableEntity(
+                    crate::services::rpm_repodata_builder::MODE_UNSUPPORTED.into(),
+                ));
+            }
+        }
         // Validate upstream_url is safe to contact if it is being updated.
         // `UpdateRepositoryRequest` carries neither `repo_type` nor `format`
         // (both are immutable after creation), so load the existing row to
@@ -1845,12 +1876,34 @@ impl RepositoryService {
                 crate::services::rpm_layout::set_depth(&mut tx, id, depth).await?;
             }
         }
+        if let Some(mode) = repodata_mode {
+            crate::services::rpm_repodata_builder::set_mode(&mut tx, id, mode).await?;
+        }
         // Project unassignment (#4026). The main UPDATE below reads a NULL
         // bind as "leave alone" (COALESCE), so clearing is a targeted write in
         // the same transaction, ahead of it, and the row it RETURNs already
         // carries the cleared value. Assigning still goes through COALESCE.
         if matches!(req.project_id, Some(None)) {
             sqlx::query("UPDATE repositories SET project_id = NULL WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        // Clearing `description` / `quota_bytes` (#4729). Same reason and same
+        // shape as the project unassignment above: the main UPDATE's COALESCE
+        // reads a NULL bind as "leave alone", so an explicit `null` is a
+        // targeted write ahead of it, and the row it RETURNs already carries
+        // the cleared values.
+        if matches!(req.description, Some(None)) {
+            sqlx::query("UPDATE repositories SET description = NULL WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        if matches!(req.quota_bytes, Some(None)) {
+            sqlx::query("UPDATE repositories SET quota_bytes = NULL WHERE id = $1")
                 .bind(id)
                 .execute(&mut *tx)
                 .await
@@ -1895,7 +1948,7 @@ impl RepositoryService {
             id,
             req.key,
             req.name,
-            req.description,
+            req.description.flatten(),
             req.is_public,
             req.quota_bytes.flatten(),
             req.upstream_url,
@@ -3876,7 +3929,7 @@ mod tests {
                     repo_id,
                     UpdateRepositoryRequest {
                         name: Some("managed by terraform".to_string()),
-                        description: Some("tf".to_string()),
+                        description: Some(Some("tf".to_string())),
                         visibility: None,
                         is_public: Some(false),
                         quota_bytes: Some(Some(1024)),
@@ -4029,7 +4082,7 @@ mod tests {
             versioning_enabled: None,
             key: None,
             name: Some("Updated Name".to_string()),
-            description: Some("Updated Description".to_string()),
+            description: Some(Some("Updated Description".to_string())),
             is_public: Some(false),
             quota_bytes: Some(Some(2_000_000_000)),
             upstream_url: None,

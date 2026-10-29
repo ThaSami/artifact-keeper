@@ -51,6 +51,7 @@ use crate::services::repository_service::{
 };
 use crate::services::routing_rules::{self, RoutingRule};
 use crate::services::rpm_layout;
+use crate::services::rpm_repodata_builder::{self, RepodataMode};
 use crate::services::signing_service::SigningService;
 use crate::services::upload_service;
 use crate::services::upstream_filter::{self, UpstreamFilter};
@@ -976,6 +977,14 @@ pub struct CreateRepositoryRequest {
     #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
     #[schema(minimum = 0, maximum = 1023, nullable = false)]
     pub repodata_depth: Option<u32>,
+    /// How a local RPM repository's repodata is produced (#4544):
+    /// `precomputed` (the default) builds it in the background after each
+    /// change and serves it from storage; `on_request` renders it on the
+    /// request path and validates it against the repository on every request
+    /// (read-your-writes). Rejected (422) for any other repository.
+    #[serde(default, deserialize_with = "rpm_repodata_builder::deserialize_mode")]
+    #[schema(nullable = false)]
+    pub repodata_mode: Option<RepodataMode>,
     pub key: String,
     pub name: String,
     pub description: Option<String>,
@@ -1227,9 +1236,23 @@ pub struct UpdateRepositoryRequest {
     #[serde(default, deserialize_with = "rpm_layout::deserialize_depth")]
     #[schema(minimum = 0, maximum = 1023, nullable = false)]
     pub repodata_depth: Option<u32>,
+    /// Omit to retain the RPM repodata mode (#4544); see
+    /// `CreateRepositoryRequest.repodata_mode`. Local RPM repositories only.
+    #[serde(default, deserialize_with = "rpm_repodata_builder::deserialize_mode")]
+    #[schema(nullable = false)]
+    pub repodata_mode: Option<RepodataMode>,
     pub key: Option<String>,
     pub name: Option<String>,
-    pub description: Option<String>,
+    /// Update or clear the description (#4729). Three-way semantics via
+    /// `Option<Option<String>>`: omit the field to leave the stored
+    /// description unchanged; send `null` to clear it (store NULL); send a
+    /// string to set it (the empty string is stored as-is, not as NULL).
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
+    #[schema(value_type = Option<String>)]
+    pub description: Option<Option<String>>,
     /// Replace the repository's upstream URL (#4467), e.g. to rotate
     /// credentials embedded as userinfo or to repoint a Remote. Validated
     /// exactly like `upstream_url` on create (anti-SSRF, scheme/host and the
@@ -1271,7 +1294,18 @@ pub struct UpdateRepositoryRequest {
     /// not need it again; send `false` to withdraw it. Accepting it is logged
     /// at WARN and recorded in the audit log.
     pub allow_public_with_upstream_credentials: Option<bool>,
-    pub quota_bytes: Option<i64>,
+    /// Update or clear the repository quota (#4729). Three-way semantics via
+    /// `Option<Option<i64>>`: omit the field to leave the stored quota
+    /// unchanged; send `null` to clear it (NULL means unlimited); send a
+    /// value in `0..=100 TiB` to set it (`0` is the legacy unlimited
+    /// sentinel, kept for compatibility). A negative or oversized value is a
+    /// 400.
+    #[serde(
+        default,
+        deserialize_with = "crate::api::extractors::deserialize_double_option"
+    )]
+    #[schema(value_type = Option<i64>)]
+    pub quota_bytes: Option<Option<i64>>,
     /// When provided, enables/disables the `promotion_only` policy for this
     /// repository (admin-only). When omitted, the flag is left unchanged.
     pub promotion_only: Option<bool>,
@@ -1436,6 +1470,11 @@ pub struct RepositoryResponse {
     pub repodata_depth: u32,
     /// Structural eligibility and emptiness only, not an authorization grant.
     pub repodata_depth_editable: bool,
+    /// RPM repodata mode (#4544), present for local RPM repositories only:
+    /// `precomputed` (default) or `on_request`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub repodata_mode: Option<RepodataMode>,
     pub id: Uuid,
     pub key: String,
     pub name: String,
@@ -1598,9 +1637,18 @@ pub struct RpmRepodataDepthCapability {
     pub default: u32,
 }
 
+/// Precomputed RPM repodata (#4544): `repodata_mode` and
+/// `POST /api/v1/repositories/{key}/rpm/repodata/rebuild`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RpmRepodataModeCapability {
+    pub supported: bool,
+    pub default: RepodataMode,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RepositoryCapabilities {
     pub rpm_repodata_depth: RpmRepodataDepthCapability,
+    pub rpm_repodata_mode: RpmRepodataModeCapability,
 }
 
 /// Non-mutating feature detection, including on an installation with no repositories.
@@ -1617,6 +1665,10 @@ pub async fn repository_capabilities() -> Json<RepositoryCapabilities> {
             max: rpm_layout::MAX_REPODATA_DEPTH,
             default: 0,
         },
+        rpm_repodata_mode: RpmRepodataModeCapability {
+            supported: true,
+            default: RepodataMode::Precomputed,
+        },
     })
 }
 
@@ -1630,6 +1682,9 @@ async fn with_repodata_depth(
         .ok_or_else(|| AppError::NotFound("Repository not found".into()))?;
     response.repodata_depth = depth;
     response.repodata_depth_editable = editable;
+    response.repodata_mode = rpm_repodata_builder::modes(db, &[response.id])
+        .await?
+        .remove(&response.id);
     Ok(response)
 }
 
@@ -1968,6 +2023,7 @@ fn repo_to_response(
     RepositoryResponse {
         repodata_depth: 0,
         repodata_depth_editable: false,
+        repodata_mode: None,
         id: repo.id,
         key: repo.key,
         name: repo.name,
@@ -4053,6 +4109,7 @@ pub async fn list_repositories(
     }
 
     let depth_settings = rpm_layout::settings(&state.db, &repo_ids).await?;
+    let mut repodata_modes = rpm_repodata_builder::modes(&state.db, &repo_ids).await?;
     let items: Vec<RepositoryResponse> = repos
         .into_iter()
         .map(|r| {
@@ -4068,6 +4125,7 @@ pub async fn list_repositories(
                 resp.repodata_depth = depth;
                 resp.repodata_depth_editable = editable;
             }
+            resp.repodata_mode = repodata_modes.remove(&resp.id);
             resp
         })
         .collect();
@@ -4097,7 +4155,7 @@ pub async fn list_repositories(
         (status = 401, description = "Authentication required"),
         (status = 403, description = "Insufficient permissions: needs global admin, system repository admin, or project admin of the requested project_id"),
         (status = 409, description = "Repository key already exists or concurrent layout change; retry"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
     )
 )]
 pub async fn create_repository(
@@ -4400,6 +4458,7 @@ pub async fn create_repository(
                 created_by: Some(auth.user_id),
             },
             payload.repodata_depth.unwrap_or(0),
+            payload.repodata_mode,
             provisioner,
         )
         .await?;
@@ -5224,7 +5283,7 @@ pub async fn get_repository_storage_tree(
         (status = 403, description = "Insufficient permissions: needs repository admin, plus project admin of the destination project when changing project_id, or of the current project when clearing it with null"),
         (status = 404, description = "Repository not found"),
         (status = 409, description = "Repository key conflict, nonempty repository depth change, concurrent layout change, or an upstream_url origin change while upstream-auth credentials are configured"),
-        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository"),
+        (status = 422, description = "Positive repodata_depth requires an eligible local RPM repository; repodata_mode requires a local RPM repository"),
     )
 )]
 pub async fn update_repository(
@@ -5248,8 +5307,9 @@ pub async fn update_repository(
         )?;
     }
 
-    // Validate quota_bytes is within a reasonable range (max 100 TiB)
-    if let Some(quota) = payload.quota_bytes {
+    // Validate quota_bytes is within a reasonable range (max 100 TiB).
+    // `Some(None)` is an explicit clear (#4729) and needs no validation.
+    if let Some(Some(quota)) = payload.quota_bytes {
         if !(0..=100 * 1024 * 1024 * 1024 * 1024).contains(&quota) {
             return Err(AppError::Validation(
                 "quota_bytes must be between 0 and 100 TiB".to_string(),
@@ -5404,10 +5464,14 @@ pub async fn update_repository(
             ServiceUpdateRepoReq {
                 key: payload.key,
                 name: payload.name,
+                // Three-way (#4729): omit = unchanged, Some(None) = clear,
+                // Some(Some(text)) = set.
                 description: payload.description,
                 visibility: effective_visibility,
                 is_public: effective_is_public,
-                quota_bytes: payload.quota_bytes.map(Some),
+                // Three-way (#4729): omit = unchanged, Some(None) = clear
+                // (unlimited), Some(Some(bytes)) = set.
+                quota_bytes: payload.quota_bytes,
                 upstream_url: payload.upstream_url.clone(),
                 promotion_only: payload.promotion_only,
                 versioning_enabled: payload.versioning_enabled,
@@ -5425,6 +5489,7 @@ pub async fn update_repository(
                 curation_default_action: payload.curation_default_action,
             },
             payload.repodata_depth,
+            payload.repodata_mode,
         )
         .await?;
 
@@ -13096,9 +13161,9 @@ pub async fn get_egress_proxy(
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "Upstream reachable"),
-        (status = 400, description = "Repository is not remote or has no upstream URL"),
+        (status = 400, description = "Repository is not remote, has no upstream URL, or its upstream URL is not allowed"),
         (status = 401, description = "Authentication required"),
-        (status = 404, description = "Repository not found"),
+        (status = 404, description = "Repository not found, or the repository's upstream filter refuses the upstream root (nothing is sent)"),
         (status = 502, description = "Upstream unreachable"),
     )
 )]
@@ -13120,25 +13185,21 @@ pub async fn test_upstream(
         AppError::Validation("Repository has no upstream URL configured".to_string())
     })?;
 
-    let client = crate::services::http_client::base_client_builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?;
+    // #840: the probe is upstream contact like any other fetch, so the
+    // repository's upstream filter gates it. The probe requests the upstream
+    // root, whose subject is the empty path: a filter that lists only
+    // `include_patterns` for package paths therefore refuses it (404, nothing
+    // sent) unless a pattern admits `^$`/`.*`.
+    crate::services::upstream_filter::ensure_upstream_allowed(
+        &state.db,
+        repo.id,
+        &key,
+        upstream_url,
+        "",
+    )
+    .await?;
 
-    let mut request = client.head(upstream_url);
-
-    // Apply upstream auth if configured
-    if let Some(upstream_auth) =
-        crate::services::upstream_auth::load_upstream_auth(&state.db, repo.id).await?
-    {
-        request = crate::services::upstream_auth::apply_upstream_auth(request, &upstream_auth);
-    }
-
-    // Through `send_upstream` (#3954): a `CLIENT` span with the HTTP client
-    // attributes, parented to this request's span, and `traceparent` sent on.
-    let response = crate::services::upstream_tracing::send_upstream(request)
-        .await
-        .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {e}")))?;
+    let response = probe_upstream(&state.db, repo.id, upstream_url).await?;
 
     let status = response.status().as_u16();
     // 2xx or 404 (root URL may not serve content) are acceptable
@@ -13156,6 +13217,56 @@ pub async fn test_upstream(
             "Upstream returned HTTP {status}"
         )))
     }
+}
+
+/// Send the `test_upstream` connectivity probe the way the proxy fetch path
+/// reaches an upstream: the URL passes the upstream URL validation first,
+/// and the request goes out on the repository's egress route (its `direct`
+/// or `explicit` proxy configuration, else the default client).
+async fn probe_upstream(
+    db: &sqlx::PgPool,
+    repo_id: Uuid,
+    upstream_url: &str,
+) -> Result<reqwest::Response> {
+    // A stored URL predating the write-time check, or one the operator's
+    // allowlist no longer admits, is refused before any request is sent.
+    // Off the async worker: the validation may resolve the host.
+    let url = upstream_url.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::api::validation::validate_outbound_url(&url, "Upstream URL")
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("upstream URL validation task failed: {e}")))??;
+    let egress = crate::services::egress_proxy::load_egress_proxy(db, repo_id).await?;
+    let upstream_auth = crate::services::upstream_auth::load_upstream_auth(db, repo_id).await?;
+    send_upstream_probe(&egress, upstream_url, upstream_auth.as_ref()).await
+}
+
+/// The client half of [`probe_upstream`]. The error never carries the
+/// request URL: a stored upstream URL may hold credentials in its userinfo.
+async fn send_upstream_probe(
+    egress: &crate::services::egress_proxy::EgressProxyConfig,
+    upstream_url: &str,
+    upstream_auth: Option<&crate::services::upstream_auth::UpstreamAuthType>,
+) -> Result<reqwest::Response> {
+    let client = if egress.overrides_default_routing() {
+        crate::services::egress_proxy::build_repo_client(egress)?
+    } else {
+        crate::services::http_client::base_client_builder()
+            .build()
+            .map_err(|e| AppError::Internal(format!("Failed to build HTTP client: {e}")))?
+    };
+
+    let mut request = client.head(upstream_url).timeout(Duration::from_secs(15));
+    if let Some(upstream_auth) = upstream_auth {
+        request = crate::services::upstream_auth::apply_upstream_auth(request, upstream_auth);
+    }
+
+    // Through `send_upstream` (#3954): a `CLIENT` span with the HTTP client
+    // attributes, parented to this request's span, and `traceparent` sent on.
+    crate::services::upstream_tracing::send_upstream(request)
+        .await
+        .map_err(|e| AppError::BadGateway(format!("Failed to reach upstream: {}", e.without_url())))
 }
 
 // ---------------------------------------------------------------------------
@@ -13453,9 +13564,12 @@ pub async fn get_upstream_filter(
 ///   `files.pythonhosted.org`, cargo `dl` hosts, NuGet service URLs): the full
 ///   absolute URL, unless it lies under the upstream URL.
 ///
-/// Not filtered in this version: npm `/-/` passthroughs (search, attestations,
-/// ping) and npm audit, curation upstream sync, change feeds, and the admin
-/// `test-upstream` probe.
+/// Not filtered: the npm upstream change feed (a single global subscription
+/// that is not a per-repository upstream fetch, so it has no subject).
+///
+/// The curation upstream sync (RPM/Debian index walks and the PyPI attestation
+/// enrichment) and the admin `test-upstream` probe apply the filter too, since
+/// 1.12.0 (#840).
 ///
 /// A proxy-cache entry for a refused path is served only while it is fresh:
 /// once it expires it is neither revalidated nor served stale, and answers 404
@@ -13856,6 +13970,8 @@ async fn load_routing_rules(db: &sqlx::PgPool, repo_id: Uuid) -> Vec<RoutingRule
         RepositoryResponse,
         RepositoryCapabilities,
         RpmRepodataDepthCapability,
+        RpmRepodataModeCapability,
+        RepodataMode,
         RepositoryListResponse,
         RepositoryStorageStatsResponse,
         StorageTreeQuery,
@@ -16978,6 +17094,7 @@ mod tests {
         let resp = RepositoryResponse {
             repodata_depth: 0,
             repodata_depth_editable: false,
+            repodata_mode: None,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
@@ -18393,6 +18510,7 @@ mod tests {
         let resp = RepositoryResponse {
             repodata_depth: 0,
             repodata_depth_editable: false,
+            repodata_mode: None,
             versioning_enabled: false,
             has_trusted_gpg_key: false,
             id: Uuid::new_v4(),
@@ -24457,6 +24575,102 @@ mod tests {
     // -----------------------------------------------------------------------
     // UpstreamAuthRequest deserialization
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // test_upstream connectivity probe
+    // -----------------------------------------------------------------------
+
+    /// The probe applies the upstream URL validation before it sends
+    /// anything: a stored upstream URL naming a disallowed address is refused
+    /// with a 400, and no database read or request happens.
+    #[tokio::test]
+    async fn test_upstream_probe_refuses_disallowed_address() {
+        // Never connected: validation refuses before the first query.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://probe@127.0.0.1:1/none")
+            .expect("lazy pool");
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/",
+            "http://localhost/",
+            "file:///etc/passwd",
+        ] {
+            let err = probe_upstream(&pool, Uuid::new_v4(), url)
+                .await
+                .expect_err(url);
+            assert!(matches!(err, AppError::Validation(_)), "{url}: {err:?}");
+        }
+    }
+
+    /// A probe that cannot reach the upstream answers 502 without echoing the
+    /// request URL, so credentials in the stored URL's userinfo stay out of
+    /// the response.
+    #[tokio::test]
+    async fn test_upstream_probe_error_does_not_echo_url_credentials() {
+        use crate::services::egress_proxy::{EgressProxyConfig, EgressProxyMode};
+        // A proxy on a closed local port: the send fails at once, with no DNS.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = closed.local_addr().expect("addr").port();
+        drop(closed);
+        let egress = EgressProxyConfig {
+            mode: EgressProxyMode::Explicit,
+            proxy_url: Some(format!("http://127.0.0.1:{port}")),
+            no_proxy: None,
+        };
+        let err = send_upstream_probe(&egress, "https://user:secret@upstream.example.com/", None)
+            .await
+            .expect_err("nothing listens on the proxy port");
+        let AppError::BadGateway(msg) = err else {
+            panic!("expected a 502, got {err:?}");
+        };
+        assert!(msg.starts_with("Failed to reach upstream"), "{msg}");
+        assert!(!msg.contains("secret"), "credentials echoed: {msg}");
+        assert!(!msg.contains("user:"), "userinfo echoed: {msg}");
+    }
+
+    /// The probe goes out on the repository's egress route: with an explicit
+    /// proxy configured, the request reaches the proxy (absolute-form request
+    /// line) rather than the upstream host directly.
+    #[tokio::test]
+    async fn test_upstream_probe_uses_repository_egress_proxy() {
+        use crate::services::egress_proxy::{EgressProxyConfig, EgressProxyMode};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let proxy = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let mut head = Vec::new();
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.expect("read");
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            sock.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .expect("write");
+            String::from_utf8_lossy(&head).into_owned()
+        });
+        let egress = EgressProxyConfig {
+            mode: EgressProxyMode::Explicit,
+            proxy_url: Some(format!("http://127.0.0.1:{port}")),
+            no_proxy: None,
+        };
+        let response = send_upstream_probe(&egress, "http://upstream.example.com/simple/", None)
+            .await
+            .expect("the proxy answers");
+        assert_eq!(response.status().as_u16(), 200);
+        let head = proxy.await.expect("proxy task");
+        assert!(
+            head.starts_with("HEAD http://upstream.example.com/simple/ HTTP/1.1"),
+            "request did not go through the configured proxy: {head:?}"
+        );
+    }
 
     #[test]
     fn test_upstream_auth_request_basic() {
@@ -30838,6 +31052,29 @@ mod tests {
     }
 
     #[test]
+    fn update_request_description_and_quota_are_three_way_4729() {
+        let parse = |v: serde_json::Value| -> UpdateRepositoryRequest {
+            serde_json::from_value(v).expect("deserialize")
+        };
+
+        // Absent: leave both unchanged.
+        let absent = parse(serde_json::json!({}));
+        assert_eq!(absent.description, None);
+        assert_eq!(absent.quota_bytes, None);
+
+        // Explicit null: clear both. A bare `Option<_>` collapsed this into
+        // "absent", which is the bug this guards.
+        let cleared = parse(serde_json::json!({ "description": null, "quota_bytes": null }));
+        assert_eq!(cleared.description, Some(None));
+        assert_eq!(cleared.quota_bytes, Some(None));
+
+        // Values: set both.
+        let set = parse(serde_json::json!({ "description": "x", "quota_bytes": 1024 }));
+        assert_eq!(set.description, Some(Some("x".to_string())));
+        assert_eq!(set.quota_bytes, Some(Some(1024)));
+    }
+
+    #[test]
     fn project_assignment_change_ignores_omitted_and_unchanged_4026() {
         let (p, q) = (Uuid::new_v4(), Uuid::new_v4());
         assert_eq!(project_assignment_change(Some(p), None), None);
@@ -31990,6 +32227,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    /// #4729: `PATCH` with `{"description": null}` or `{"quota_bytes": null}`
+    /// clears the column instead of answering 200 and changing nothing.
+    /// Omitting either field still leaves it alone, which is what a client
+    /// that does not manage it relies on.
+    ///
+    /// Fails on `main`: both were bare `Option<_>` request fields (so `null`
+    /// deserialized as "absent") and the service's `COALESCE` UPDATE read the
+    /// resulting NULL bind as "leave alone".
+    #[tokio::test]
+    async fn update_repository_clears_description_and_quota_4729_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        async fn stored(pool: &sqlx::PgPool, repo_id: Uuid) -> (Option<String>, Option<i64>) {
+            sqlx::query_as::<_, (Option<String>, Option<i64>)>(
+                "SELECT description, quota_bytes FROM repositories WHERE id = $1",
+            )
+            .bind(repo_id)
+            .fetch_one(pool)
+            .await
+            .expect("read repository")
+        }
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "generic").await;
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let patch = |json: &str| {
+            update_repository(
+                State(state.clone()),
+                Extension(Some(admin_auth(user_id, &username))),
+                Path(repo_key.clone()),
+                Json(serde_json::from_str(json).expect("deserialize update payload")),
+            )
+        };
+
+        // Seed both fields through the same PATCH path.
+        let Json(seeded) = patch(r#"{"description":"keep me","quota_bytes":1048576}"#)
+            .await
+            .expect("seed description and quota");
+        assert_eq!(seeded.description.as_deref(), Some("keep me"));
+        assert_eq!(seeded.quota_bytes, Some(1_048_576));
+
+        // Omitting both leaves them alone: the behaviour that must not
+        // regress when `null` starts meaning "clear".
+        let Json(untouched) = patch(r#"{"name":"renamed"}"#)
+            .await
+            .expect("description- and quota-omitted PATCH");
+        assert_eq!(untouched.description.as_deref(), Some("keep me"));
+        assert_eq!(untouched.quota_bytes, Some(1_048_576));
+        assert_eq!(
+            stored(&pool, repo_id).await,
+            (Some("keep me".to_string()), Some(1_048_576))
+        );
+
+        // Explicit nulls clear both, in the response and in the row.
+        let Json(cleared) = patch(r#"{"description":null,"quota_bytes":null}"#)
+            .await
+            .expect("null clears description and quota");
+        assert_eq!(
+            cleared.description, None,
+            "response echoes the cleared description"
+        );
+        assert_eq!(
+            cleared.quota_bytes, None,
+            "response echoes the cleared quota"
+        );
+        assert_eq!(stored(&pool, repo_id).await, (None, None));
+
+        // Clearing again is an idempotent 200.
+        patch(r#"{"description":null,"quota_bytes":null}"#)
+            .await
+            .expect("clearing twice is idempotent");
+
+        let _ = sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await;
+        tdh::cleanup_user(&pool, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
     /// PATCH plumbing: a non-empty value validates + upserts and is echoed;
     /// an empty string deletes the config row and echoes `None`; a value with
     /// control characters is rejected; a non-remote repo is rejected.
@@ -32602,6 +32923,7 @@ mod tests {
         let mut resp = RepositoryResponse {
             repodata_depth: 0,
             repodata_depth_editable: false,
+            repodata_mode: None,
             id: Uuid::new_v4(),
             has_trusted_gpg_key: false,
             key: "ua-serde".to_string(),
@@ -36026,6 +36348,82 @@ mod content_encoding_forwarding_tests {
             exported_upstream_client_spans(&exported, "HEAD"),
             vec![("HEAD".to_string(), upstream, 204)],
             "one CLIENT span for the probe, with an integer status"
+        );
+    }
+
+    /// #840: the `test-upstream` probe is upstream contact, so the Remote's
+    /// upstream filter gates it. The probe requests the upstream root (subject:
+    /// the empty path), which an include-only filter for package paths refuses:
+    /// the probe answers 404 and the mock receives nothing. The unfiltered
+    /// control at the top proves the mock is reachable — a probe that simply
+    /// never sent would fail it.
+    #[tokio::test]
+    async fn test_test_upstream_honours_the_upstream_filter_840() {
+        use crate::services::upstream_filter::{save_upstream_filter, UpstreamFilter};
+
+        let Some(fx) = tdh::Fixture::setup("remote", "generic").await else {
+            return;
+        };
+        let (server, _ssrf) = tdh::non_loopback_mock_server().await;
+        Mock::given(wm_method("HEAD"))
+            .and(wm_path("/probe"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let upstream = format!("{}/probe", server.uri());
+        sqlx::query("UPDATE repositories SET upstream_url = $1 WHERE id = $2")
+            .bind(&upstream)
+            .bind(fx.repo_id)
+            .execute(&fx.pool)
+            .await
+            .expect("set upstream_url");
+
+        let probe = || {
+            let state = fx.state.clone();
+            let user_id = fx.user_id;
+            let username = fx.username.clone();
+            let repo_key = fx.repo_key.clone();
+            async move {
+                super::test_upstream(
+                    axum::extract::State(state),
+                    Extension(Some(tdh::admin_auth(user_id, &username))),
+                    axum::extract::Path(repo_key),
+                )
+                .await
+            }
+        };
+
+        // Control: with no filter the probe reaches the mock.
+        let open = probe().await;
+        assert!(
+            open.is_ok(),
+            "an unfiltered probe must reach the mock: {open:?}"
+        );
+
+        save_upstream_filter(
+            &fx.pool,
+            fx.repo_id,
+            &UpstreamFilter {
+                include_patterns: vec!["^com/acme/".to_string()],
+                exclude_patterns: vec![],
+            },
+        )
+        .await
+        .expect("save filter");
+        let before = server.received_requests().await.unwrap_or_default().len();
+        let refused = probe().await;
+        let after = server.received_requests().await.unwrap_or_default().len();
+        fx.teardown().await;
+
+        match refused {
+            Err(AppError::NotFound(msg)) => {
+                assert!(msg.contains("upstream filter"), "{msg}");
+            }
+            other => panic!("a probe refused by the filter must be NotFound, got {other:?}"),
+        }
+        assert_eq!(
+            after, before,
+            "a probe refused by the upstream filter must not contact the upstream"
         );
     }
 }
